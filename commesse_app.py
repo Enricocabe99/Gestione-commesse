@@ -412,7 +412,7 @@ def main():
         st.rerun()
     st.sidebar.markdown("---")
 
-    menu_options = ["Dashboard", "Commesse", "Attività Personali", "Resoconto", "Storico", "Backup"]
+    menu_options = ["Commesse", "Attività Personali", "Resoconto", "Backup"]
     if st.session_state['is_admin']:
         menu_options.append("Amministrazione Utenti")
     scelta = st.sidebar.radio("Naviga", menu_options)
@@ -471,7 +471,7 @@ def main():
                     st.rerun()
 
         # Tab per Albero, Riepilogo e Ingegneri
-        tab_albero, tab_riepilogo, tab_ingegneri = st.tabs(["🌳 Albero", "📋 Riepilogo", "👷 Ingegneri"])
+        tab_albero, tab_riepilogo, tab_ingegneri = st.tabs(["🛠️ Lavori", "📋 Riepilogo", "👷 Ingegneri"])
 
         # ==================== TAB ALBERO ====================
         with tab_albero:
@@ -482,9 +482,9 @@ def main():
                     with col1:
                         anno_input = st.text_input("Anno *", value=str(datetime.today().year))
                     with col2:
-                        num_id = st.text_input("Numero identificativo *", placeholder="es. 26100")
+                        num_id = st.text_input("Numero identificativo *")
                     with col3:
-                        nome_comm = st.text_input("Nome commessa *", placeholder="es. Ermetika")
+                        nome_comm = st.text_input("Nome commessa *")
                     with col4:
                         data_in = st.date_input("Data inizio", datetime.today())
                     with col5:

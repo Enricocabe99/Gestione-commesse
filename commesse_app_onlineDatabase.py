@@ -1,5 +1,6 @@
 import streamlit as st
-import sqlite3
+import psycopg2
+from psycopg2 import pool, sql
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -10,72 +11,29 @@ import json
 import os
 
 # ==================== CONFIG ====================
-DATABASE = "commesse.db"  # Usato solo per fallback locale
-
-# Tentativo di importare libsql per Turso, con fallback
-try:
-    import libsql_experimental as libsql
-    LIB_AVAILABLE = True
-except ImportError:
-    LIB_AVAILABLE = False
-    libsql = None
+# DATABASE_URL viene dai secrets di Streamlit o da variabile d'ambiente
+# Formato: postgresql://user:password@host:port/dbname
 
 # ==================== FUNZIONI DATABASE ====================
+@st.cache_resource
+def init_connection_pool():
+    db_url = st.secrets["database"]["url"]  # Imposta in Streamlit Cloud
+    return psycopg2.pool.SimpleConnectionPool(1, 10, dsn=db_url)
+
 def get_connection():
-    """
-    Se trova i secrets di Turso, usa il DB cloud (libsql).
-    Altrimenti usa il file SQLite locale per test.
-    """
-    if "turso" in st.secrets and LIB_AVAILABLE:
-        # Modalità cloud Turso
-        url = st.secrets["turso"]["url"]
-        token = st.secrets["turso"]["token"]
-        conn = libsql.connect(url, auth_token=token)
-        return conn
-    else:
-        # Modalità locale (file .db)
-        conn = sqlite3.connect(DATABASE, check_same_thread=False)
-        # Nota: non eseguiamo PRAGMA journal_mode perché su Turso non serve e su locale va bene
-        return conn
+    pool = init_connection_pool()
+    return pool.getconn()
 
-def fix_commesse_anni(conn):
-    """Assegna un anno valido a tutte le commesse che ne sono sprovviste."""
-    anno_corrente = datetime.today().year
-    cur = conn.execute("SELECT id FROM anni WHERE anno=?", (anno_corrente,))
-    row = cur.fetchone()
-    if row:
-        anno_default = row[0]
-    else:
-        conn.execute("INSERT INTO anni (anno) VALUES (?)", (anno_corrente,))
-        conn.commit()
-        # In Turso, last_insert_rowid() funziona allo stesso modo
-        anno_default = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-    conn.execute("""
-        UPDATE commesse
-        SET anno_id = ?
-        WHERE anno_id IS NULL
-           OR anno_id NOT IN (SELECT id FROM anni)
-    """, (anno_default,))
-    conn.commit()
-
-def migrate_database(conn):
-    cursor = conn.execute("PRAGMA table_info(commesse)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if 'anno_id' not in columns:
-        conn.execute("CREATE TABLE IF NOT EXISTS anni (id INTEGER PRIMARY KEY AUTOINCREMENT, anno INTEGER UNIQUE NOT NULL)")
-        conn.execute("ALTER TABLE commesse ADD COLUMN anno_id INTEGER REFERENCES anni(id)")
-        anno_corrente = datetime.today().year
-        conn.execute("INSERT OR IGNORE INTO anni (anno) VALUES (?)", (anno_corrente,))
-        anno_id = conn.execute("SELECT id FROM anni WHERE anno=?", (anno_corrente,)).fetchone()[0]
-        conn.execute("UPDATE commesse SET anno_id = ? WHERE anno_id IS NULL", (anno_id,))
-        conn.commit()
-    fix_commesse_anni(conn)
+def release_connection(conn):
+    pool = init_connection_pool()
+    pool.putconn(conn)
 
 def init_db(conn):
-    conn.executescript("""
+    """Crea le tabelle se non esistono (sintassi PostgreSQL)."""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS utenti (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             nome TEXT NOT NULL,
@@ -85,38 +43,36 @@ def init_db(conn):
         );
 
         CREATE TABLE IF NOT EXISTS anni (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             anno INTEGER UNIQUE NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS commesse (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            anno_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            anno_id INTEGER NOT NULL REFERENCES anni(id) ON DELETE CASCADE,
             nome TEXT NOT NULL,
             numero_identificativo TEXT NOT NULL,
             descrizione TEXT,
             data_inizio DATE,
             data_fine_prevista DATE,
             data_fine_effettiva DATE,
-            note TEXT,
-            FOREIGN KEY (anno_id) REFERENCES anni(id) ON DELETE CASCADE
+            note TEXT
         );
 
         CREATE TABLE IF NOT EXISTS sottolavori (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            commessa_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            commessa_id INTEGER NOT NULL REFERENCES commesse(id) ON DELETE CASCADE,
             nome TEXT NOT NULL,
             ingegnere_assegnato TEXT,
             stato TEXT DEFAULT 'In corso',
             data_inizio DATE,
             data_fine_prevista DATE,
             data_fine_effettiva DATE,
-            note TEXT,
-            FOREIGN KEY (commessa_id) REFERENCES commesse(id) ON DELETE CASCADE
+            note TEXT
         );
 
         CREATE TABLE IF NOT EXISTS attivita_personali (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             ingegnere TEXT NOT NULL,
             descrizione TEXT NOT NULL,
             stato TEXT DEFAULT 'In corso',
@@ -127,42 +83,92 @@ def init_db(conn):
         );
 
         CREATE TABLE IF NOT EXISTS cronologia (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             entita_tipo TEXT NOT NULL,
             entita_id INTEGER NOT NULL,
             data_modifica TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             dati_json TEXT NOT NULL
         );
     """)
-
-    # Gestione indice unico con pulizia automatica dei duplicati
+    # Indice unico per numero_identificativo (con gestione duplicati)
     try:
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_commesse_numero ON commesse(numero_identificativo)")
-    except Exception as e:
-        # Su Turso potrebbe fallire se ci sono duplicati, ma gestiamo
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_commesse_numero ON commesse(numero_identificativo)")
+    except psycopg2.IntegrityError:
+        # Elimina duplicati (tiene il primo)
+        cur.execute("""
+            DELETE FROM commesse
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM commesse GROUP BY numero_identificativo
+            )
+        """)
+        conn.commit()
         try:
-            conn.execute("""
-                DELETE FROM commesse
-                WHERE id NOT IN (
-                    SELECT MIN(id) FROM commesse GROUP BY numero_identificativo
-                )
-            """)
-            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_commesse_numero ON commesse(numero_identificativo)")
-        except Exception as e2:
-            st.warning(f"Impossibile creare l'indice unico: {e2}. Contatta l'amministratore.")
-
-    if conn.execute("SELECT COUNT(*) FROM utenti").fetchone()[0] == 0:
-        pw_hash = hashlib.sha256("admin".encode()).hexdigest()
-        conn.execute("INSERT INTO utenti (username, password_hash, nome, cognome, attivo, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
-                     ("admin", pw_hash, "Admin", "Sistema", 1, 1))
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_commesse_numero ON commesse(numero_identificativo)")
+        except psycopg2.IntegrityError:
+            st.warning("Impossibile creare l'indice unico. Contatta l'amministratore.")
     conn.commit()
-    migrate_database(conn)
+
+    # Inserisce utente admin se non esiste
+    cur.execute("SELECT COUNT(*) FROM utenti")
+    if cur.fetchone()[0] == 0:
+        pw_hash = hashlib.sha256("admin".encode()).hexdigest()
+        cur.execute("""
+            INSERT INTO utenti (username, password_hash, nome, cognome, attivo, is_admin)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, ("admin", pw_hash, "Admin", "Sistema", 1, 1))
+        conn.commit()
+    cur.close()
+
+def fix_commesse_anni(conn):
+    """Assegna un anno valido a tutte le commesse che ne sono sprovviste."""
+    anno_corrente = datetime.today().year
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM anni WHERE anno = %s", (anno_corrente,))
+    row = cur.fetchone()
+    if row:
+        anno_default = row[0]
+    else:
+        cur.execute("INSERT INTO anni (anno) VALUES (%s) RETURNING id", (anno_corrente,))
+        anno_default = cur.fetchone()[0]
+        conn.commit()
+    cur.execute("""
+        UPDATE commesse
+        SET anno_id = %s
+        WHERE anno_id IS NULL
+           OR anno_id NOT IN (SELECT id FROM anni)
+    """, (anno_default,))
+    conn.commit()
+    cur.close()
+
+def migra_database(conn):
+    """Controlla se la colonna anno_id esiste e la crea se manca."""
+    cur = conn.cursor()
+    # Verifica se colonna anno_id esiste
+    cur.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name='commesse' AND column_name='anno_id'
+    """)
+    if not cur.fetchone():
+        # Crea tabella anni e aggiunge colonna
+        cur.execute("CREATE TABLE IF NOT EXISTS anni (id SERIAL PRIMARY KEY, anno INTEGER UNIQUE NOT NULL)")
+        cur.execute("ALTER TABLE commesse ADD COLUMN anno_id INTEGER REFERENCES anni(id)")
+        anno_corrente = datetime.today().year
+        cur.execute("INSERT INTO anni (anno) VALUES (%s) ON CONFLICT (anno) DO NOTHING", (anno_corrente,))
+        cur.execute("SELECT id FROM anni WHERE anno = %s", (anno_corrente,))
+        anno_id = cur.fetchone()[0]
+        cur.execute("UPDATE commesse SET anno_id = %s WHERE anno_id IS NULL", (anno_id,))
+        conn.commit()
+    cur.close()
+    fix_commesse_anni(conn)
 
 # ==================== LOGIN / UTENTI ====================
 def verifica_login(conn, username, password):
     pw_hash = hashlib.sha256(password.encode()).hexdigest()
-    user = conn.execute("SELECT * FROM utenti WHERE username=? AND password_hash=? AND attivo=1",
-                        (username, pw_hash)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM utenti WHERE username=%s AND password_hash=%s AND attivo=1", (username, pw_hash))
+    user = cur.fetchone()
+    cur.close()
     return user
 
 def ottieni_utenti_attivi(conn):
@@ -173,23 +179,35 @@ def ottieni_tutti_utenti(conn):
 
 def aggiungi_utente(conn, username, password, nome, cognome, is_admin=0):
     pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    cur = conn.cursor()
     try:
-        conn.execute("INSERT INTO utenti (username, password_hash, nome, cognome, attivo, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
-                     (username, pw_hash, nome, cognome, 1, is_admin))
+        cur.execute("""
+            INSERT INTO utenti (username, password_hash, nome, cognome, attivo, is_admin)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (username, pw_hash, nome, cognome, 1, is_admin))
         conn.commit()
         return True, "Utente creato."
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()
         return False, "Username già esistente."
+    finally:
+        cur.close()
 
 def aggiorna_stato_utente(conn, username, attivo):
-    conn.execute("UPDATE utenti SET attivo=? WHERE username=?", (attivo, username))
+    cur = conn.cursor()
+    cur.execute("UPDATE utenti SET attivo=%s WHERE username=%s", (attivo, username))
     conn.commit()
+    cur.close()
 
 # ==================== CRONOLOGIA ====================
 def salva_cronologia(conn, entita_tipo, entita_id, dati_dict):
-    conn.execute("INSERT INTO cronologia (entita_tipo, entita_id, dati_json) VALUES (?, ?, ?)",
-                 (entita_tipo, entita_id, json.dumps(dati_dict, default=str)))
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO cronologia (entita_tipo, entita_id, dati_json)
+        VALUES (%s, %s, %s)
+    """, (entita_tipo, entita_id, json.dumps(dati_dict, default=str)))
     conn.commit()
+    cur.close()
 
 # ==================== CRUD ANNI ====================
 def ottieni_o_crea_anno(conn, anno):
@@ -198,50 +216,69 @@ def ottieni_o_crea_anno(conn, anno):
         anno_int = int(anno)
     except ValueError:
         return None
-    cur = conn.execute("SELECT id FROM anni WHERE anno=?", (anno_int,))
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM anni WHERE anno=%s", (anno_int,))
     row = cur.fetchone()
     if row:
+        cur.close()
         return row[0]
-    conn.execute("INSERT INTO anni (anno) VALUES (?)", (anno_int,))
+    cur.execute("INSERT INTO anni (anno) VALUES (%s) ON CONFLICT (anno) DO NOTHING RETURNING id", (anno_int,))
+    res = cur.fetchone()
+    if res is None:
+        # Se il conflitto ha evitato l'inserimento, leggiamo l'id esistente
+        cur.execute("SELECT id FROM anni WHERE anno=%s", (anno_int,))
+        res = cur.fetchone()
     conn.commit()
-    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    cur.close()
+    return res[0] if res else None
 
 def leggi_anni(conn):
     return pd.read_sql("SELECT * FROM anni ORDER BY anno DESC", conn)
 
 # ==================== CRUD COMMESSE ====================
 def aggiungi_commessa(conn, anno_id, nome, numero_id, data_inizio, data_fine_prevista):
+    cur = conn.cursor()
     try:
-        cur = conn.execute("""
+        cur.execute("""
             INSERT INTO commesse (anno_id, nome, numero_identificativo, data_inizio, data_fine_prevista)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
         """, (anno_id, nome, numero_id, data_inizio, data_fine_prevista))
+        nuova_id = cur.fetchone()[0]
         conn.commit()
-        nuova_id = cur.lastrowid
         dati = {"anno_id": anno_id, "nome": nome, "numero_identificativo": numero_id, "data_inizio": str(data_inizio)}
         salva_cronologia(conn, "commessa", nuova_id, dati)
         return True, "Commessa aggiunta."
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()
         return False, "Numero identificativo già esistente."
+    finally:
+        cur.close()
 
 def aggiorna_commessa(conn, commessa_id, **campi):
     campi_validi = ["nome", "numero_identificativo", "descrizione", "data_inizio", "data_fine_prevista", "data_fine_effettiva", "note"]
-    set_clause = ", ".join(f"{k}=?" for k in campi if k in campi_validi)
+    set_clause = ", ".join(f"{k}=%s" for k in campi if k in campi_validi)
     valori = [v for k, v in campi.items() if k in campi_validi]
     if not set_clause:
         return False, "Nessun campo valido."
     valori.append(commessa_id)
-    conn.execute(f"UPDATE commesse SET {set_clause} WHERE id=?", valori)
+    cur = conn.cursor()
+    cur.execute(f"UPDATE commesse SET {set_clause} WHERE id=%s", valori)
     conn.commit()
-    row = conn.execute("SELECT * FROM commesse WHERE id=?", (commessa_id,)).fetchone()
-    if row:
-        dati = {"id": row[0], "nome": row[2], "numero_identificativo": row[3]}
+    cur.close()
+    # Salva cronologia
+    row = pd.read_sql("SELECT * FROM commesse WHERE id=%s", conn, params=(commessa_id,))
+    if not row.empty:
+        row = row.iloc[0]
+        dati = {"id": row['id'], "nome": row['nome'], "numero_identificativo": row['numero_identificativo']}
         salva_cronologia(conn, "commessa", commessa_id, dati)
     return True, "Commessa aggiornata."
 
 def elimina_commessa(conn, commessa_id):
-    conn.execute("DELETE FROM commesse WHERE id=?", (commessa_id,))
+    cur = conn.cursor()
+    cur.execute("DELETE FROM commesse WHERE id=%s", (commessa_id,))
     conn.commit()
+    cur.close()
 
 def leggi_tutte_commesse(conn):
     return pd.read_sql("""
@@ -252,37 +289,45 @@ def leggi_tutte_commesse(conn):
 
 # ==================== CRUD SOTTOLAVORI ====================
 def aggiungi_sottolavoro(conn, commessa_id, nome, ingegnere, data_inizio, data_fine_prevista, note, stato="In corso"):
-    cur = conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         INSERT INTO sottolavori (commessa_id, nome, ingegnere_assegnato, stato, data_inizio, data_fine_prevista, note)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
     """, (commessa_id, nome, ingegnere, stato, data_inizio, data_fine_prevista, note))
+    nuova_id = cur.fetchone()[0]
     conn.commit()
-    nuova_id = cur.lastrowid
+    cur.close()
     dati = {"commessa_id": commessa_id, "nome": nome, "ingegnere": ingegnere, "stato": stato}
     salva_cronologia(conn, "sottolavoro", nuova_id, dati)
     return True, "Sottolavoro aggiunto."
 
 def aggiorna_sottolavoro(conn, sottolavoro_id, **campi):
     campi_validi = ["nome", "ingegnere_assegnato", "stato", "data_inizio", "data_fine_prevista", "data_fine_effettiva", "note"]
-    set_clause = ", ".join(f"{k}=?" for k in campi if k in campi_validi)
+    set_clause = ", ".join(f"{k}=%s" for k in campi if k in campi_validi)
     valori = [v for k, v in campi.items() if k in campi_validi]
     if not set_clause:
         return False, "Nessun campo valido."
     valori.append(sottolavoro_id)
-    conn.execute(f"UPDATE sottolavori SET {set_clause} WHERE id=?", valori)
+    cur = conn.cursor()
+    cur.execute(f"UPDATE sottolavori SET {set_clause} WHERE id=%s", valori)
     conn.commit()
-    row = conn.execute("SELECT * FROM sottolavori WHERE id=?", (sottolavoro_id,)).fetchone()
-    if row:
-        dati = {"id": row[0], "nome": row[2], "ingegnere": row[3], "stato": row[4]}
+    cur.close()
+    row = pd.read_sql("SELECT * FROM sottolavori WHERE id=%s", conn, params=(sottolavoro_id,))
+    if not row.empty:
+        row = row.iloc[0]
+        dati = {"id": row['id'], "nome": row['nome'], "ingegnere": row['ingegnere_assegnato'], "stato": row['stato']}
         salva_cronologia(conn, "sottolavoro", sottolavoro_id, dati)
     return True, "Sottolavoro aggiornato."
 
 def elimina_sottolavoro(conn, sottolavoro_id):
-    conn.execute("DELETE FROM sottolavori WHERE id=?", (sottolavoro_id,))
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sottolavori WHERE id=%s", (sottolavoro_id,))
     conn.commit()
+    cur.close()
 
 def leggi_sottolavori_per_commessa(conn, commessa_id):
-    return pd.read_sql("SELECT * FROM sottolavori WHERE commessa_id=? ORDER BY id", conn, params=(commessa_id,))
+    return pd.read_sql("SELECT * FROM sottolavori WHERE commessa_id=%s ORDER BY id", conn, params=(commessa_id,))
 
 def leggi_tutti_sottolavori(conn):
     return pd.read_sql("""
@@ -295,42 +340,53 @@ def leggi_tutti_sottolavori(conn):
 
 # ==================== ATTIVITÀ PERSONALI ====================
 def aggiungi_attivita_personale(conn, ingegnere, descrizione, data_inizio, data_fine_prevista, note, stato="In corso"):
-    cur = conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         INSERT INTO attivita_personali (ingegnere, descrizione, stato, data_inizio, data_fine_prevista, note)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
     """, (ingegnere, descrizione, stato, data_inizio, data_fine_prevista, note))
+    nuova_id = cur.fetchone()[0]
     conn.commit()
-    nuova_id = cur.lastrowid
+    cur.close()
     dati = {"ingegnere": ingegnere, "descrizione": descrizione, "stato": stato}
     salva_cronologia(conn, "personale", nuova_id, dati)
     return True, "Attività personale aggiunta."
 
 def aggiorna_attivita_personale(conn, att_id, **campi):
     campi_validi = ["descrizione", "stato", "data_inizio", "data_fine_prevista", "data_fine_effettiva", "note", "ingegnere"]
-    set_clause = ", ".join(f"{k}=?" for k in campi if k in campi_validi)
+    set_clause = ", ".join(f"{k}=%s" for k in campi if k in campi_validi)
     valori = [v for k, v in campi.items() if k in campi_validi]
     if not set_clause:
         return False, "Nessun campo valido."
     valori.append(att_id)
-    conn.execute(f"UPDATE attivita_personali SET {set_clause} WHERE id=?", valori)
+    cur = conn.cursor()
+    cur.execute(f"UPDATE attivita_personali SET {set_clause} WHERE id=%s", valori)
     conn.commit()
+    cur.close()
     return True, "Aggiornato."
 
 def elimina_attivita_personale(conn, att_id):
-    conn.execute("DELETE FROM attivita_personali WHERE id=?", (att_id,))
+    cur = conn.cursor()
+    cur.execute("DELETE FROM attivita_personali WHERE id=%s", (att_id,))
     conn.commit()
+    cur.close()
 
 def leggi_attivita_personali(conn, ingegnere=None):
     if ingegnere:
-        return pd.read_sql("SELECT * FROM attivita_personali WHERE ingegnere=? ORDER BY id", conn, params=(ingegnere,))
+        return pd.read_sql("SELECT * FROM attivita_personali WHERE ingegnere=%s ORDER BY id", conn, params=(ingegnere,))
     return pd.read_sql("SELECT * FROM attivita_personali ORDER BY id", conn)
 
 # ==================== STORICO ====================
 def stato_alla_data(conn, entita_tipo, entita_id, data_limite):
-    query = """SELECT dati_json FROM cronologia
-               WHERE entita_tipo = ? AND entita_id = ? AND data_modifica <= ?
-               ORDER BY data_modifica DESC LIMIT 1"""
-    row = conn.execute(query, (entita_tipo, entita_id, data_limite)).fetchone()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT dati_json FROM cronologia
+        WHERE entita_tipo = %s AND entita_id = %s AND data_modifica <= %s
+        ORDER BY data_modifica DESC LIMIT 1
+    """, (entita_tipo, entita_id, data_limite))
+    row = cur.fetchone()
+    cur.close()
     if row:
         return json.loads(row[0])
     return None
@@ -424,9 +480,11 @@ def main():
 
     conn = get_connection()
     init_db(conn)
+    migra_database(conn)
 
     if 'autenticato' not in st.session_state or not st.session_state['autenticato']:
         pagina_login(conn)
+        release_connection(conn)
         return
 
     st.sidebar.title(f"👤 {st.session_state['nome_completo']}")
@@ -445,13 +503,13 @@ def main():
         st.header("📊 Dashboard Lavori")
         col1, col2, col3 = st.columns(3)
         with col1:
-            n_commesse = conn.execute("SELECT COUNT(*) FROM commesse").fetchone()[0]
+            n_commesse = pd.read_sql("SELECT COUNT(*) FROM commesse", conn).iloc[0,0]
             st.markdown(f'<div class="metric-card"><h3>{n_commesse}</h3><p>Commesse totali</p></div>', unsafe_allow_html=True)
         with col2:
-            n_sott = conn.execute("SELECT COUNT(*) FROM sottolavori WHERE stato='In corso'").fetchone()[0]
+            n_sott = pd.read_sql("SELECT COUNT(*) FROM sottolavori WHERE stato='In corso'", conn).iloc[0,0]
             st.markdown(f'<div class="metric-card"><h3>{n_sott}</h3><p>Sottolavori in corso</p></div>', unsafe_allow_html=True)
         with col3:
-            n_pers = conn.execute("SELECT COUNT(*) FROM attivita_personali WHERE stato='In corso'").fetchone()[0]
+            n_pers = pd.read_sql("SELECT COUNT(*) FROM attivita_personali WHERE stato='In corso'", conn).iloc[0,0]
             st.markdown(f'<div class="metric-card"><h3>{n_pers}</h3><p>Attività personali in corso</p></div>', unsafe_allow_html=True)
 
         st.subheader("📈 Andamento lavori (nuovi vs completati)")
@@ -550,7 +608,7 @@ def main():
                         for _, row in tutte.iterrows():
                             st.session_state[f"exp_comm_{row['id']}"] = False
                         st.rerun()
-                
+
                 tutte_commesse = leggi_tutte_commesse(conn)
                 if not tutte_commesse.empty:
                     if search_query.strip():
@@ -612,7 +670,7 @@ def main():
                     st.info("Clicca sul nome di una commessa nell'albero per visualizzare/modificare i sottolavori.")
                 else:
                     comm_id = st.session_state.selected_commessa_id
-                    df_comm = pd.read_sql("SELECT c.*, a.anno FROM commesse c LEFT JOIN anni a ON c.anno_id=a.id WHERE c.id=?", conn, params=(comm_id,))
+                    df_comm = pd.read_sql("SELECT c.*, a.anno FROM commesse c LEFT JOIN anni a ON c.anno_id=a.id WHERE c.id=%s", conn, params=(comm_id,))
                     if df_comm.empty:
                         st.warning("Commessa non trovata.")
                         st.session_state.selected_commessa_id = None
@@ -632,15 +690,15 @@ def main():
                                 nuovo_numero = st.text_input("Numero identificativo", value=comm_row['numero_identificativo'])
                             with col2:
                                 nuovo_nome = st.text_input("Nome commessa", value=comm_row['nome'])
-                            
+
                             # Anno
                             anno_corrente = int(comm_row['anno']) if pd.notna(comm_row['anno']) else datetime.today().year
                             nuovo_anno = st.text_input("Anno", value=str(anno_corrente))
-                            
+
                             # Note
                             note_correnti = comm_row['note'] if comm_row['note'] else ""
                             nuove_note = st.text_area("Note", value=note_correnti, height=100)
-                            
+
                             col_salva, col_annulla = st.columns(2)
                             with col_salva:
                                 if st.form_submit_button("💾 Salva modifiche"):
@@ -657,8 +715,10 @@ def main():
                                                 numero_identificativo=nuovo_numero,
                                                 note=nuove_note)
                                             # Aggiorna anche l'anno_id
-                                            conn.execute("UPDATE commesse SET anno_id = ? WHERE id = ?", (anno_id, comm_id))
+                                            cur = conn.cursor()
+                                            cur.execute("UPDATE commesse SET anno_id = %s WHERE id = %s", (anno_id, comm_id))
                                             conn.commit()
+                                            cur.close()
                                             st.success("Commessa aggiornata")
                                             st.session_state[f"edit_commessa_{comm_id}"] = False
                                             st.rerun()
@@ -877,7 +937,7 @@ def main():
                        s.nome as sottolavoro_nome, s.ingegnere_assegnato, s.stato, s.note
                 FROM sottolavori s
                 JOIN commesse c ON s.commessa_id = c.id
-                WHERE s.ingegnere_assegnato = ?
+                WHERE s.ingegnere_assegnato = %s
                 ORDER BY c.nome, s.nome
             """, conn, params=(ingegnere_selezionato,))
 
@@ -1007,7 +1067,7 @@ def main():
                             st.rerun()
                         else:
                             st.error("La descrizione è obbligatoria.")
-                            
+
     # -------------------- ATTIVITÀ PERSONALI --------------------
     elif scelta == "Attività Personali":
         st.header("👤 Attività Personali")
@@ -1059,14 +1119,14 @@ def main():
             FROM sottolavori s
             JOIN commesse c ON s.commessa_id = c.id
             LEFT JOIN anni a ON c.anno_id = a.id
-            WHERE s.ingegnere_assegnato = ? AND s.stato = 'In corso'
+            WHERE s.ingegnere_assegnato = %s AND s.stato = 'In corso'
         """, conn, params=(ing_sel,))
         if not sott_in_corso.empty:
             st.markdown("**Sottolavori in corso:**")
             for _, r in sott_in_corso.iterrows():
                 st.write(f"🔸 {r['nome']} (Commessa {r['numero_identificativo']} - {r['commessa_nome']}, anno {int(r['anno']) if pd.notna(r['anno']) else 'n/d'}) – scadenza {r['data_fine_prevista']}")
 
-        pers_in_corso = pd.read_sql("SELECT * FROM attivita_personali WHERE ingegnere=? AND stato='In corso'", conn, params=(ing_sel,))
+        pers_in_corso = pd.read_sql("SELECT * FROM attivita_personali WHERE ingegnere=%s AND stato='In corso'", conn, params=(ing_sel,))
         if not pers_in_corso.empty:
             st.markdown("**Attività personali in corso:**")
             for _, r in pers_in_corso.iterrows():
@@ -1109,7 +1169,7 @@ def main():
                 file_name=f"backup_commesse_{datetime.today().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        st.markdown("Il database SQLite è salvato nel file `commesse.db`.")
+        st.markdown("Il database PostgreSQL è gestito dal provider cloud.")
 
     # -------------------- AMMINISTRAZIONE UTENTI --------------------
     elif scelta == "Amministrazione Utenti" and st.session_state['is_admin']:
@@ -1140,6 +1200,9 @@ def main():
                 aggiorna_stato_utente(conn, username_sel, int(nuovo_stato))
                 st.success(f"Stato di {username_sel} aggiornato.")
                 st.rerun()
+
+    # Rilascia la connessione al termine
+    release_connection(conn)
 
 if __name__ == "__main__":
     main()

@@ -8,16 +8,16 @@ from datetime import datetime, timedelta
 import hashlib
 import io
 import json
-import os
+from contextlib import contextmanager
 
 # ==================== CONFIG ====================
-# DATABASE_URL viene dai secrets di Streamlit o da variabile d'ambiente
-# Formato: postgresql://user:password@host:port/dbname
+# DATABASE_URL viene dai secrets di Streamlit
 
-# ==================== FUNZIONI DATABASE ====================
 @st.cache_resource
 def init_connection_pool():
-    db_url = st.secrets["database"]["url"]  # Imposta in Streamlit Cloud
+    """Inizializza il pool di connessioni PostgreSQL."""
+    db_url = st.secrets["database"]["url"]
+    # Max 10 connessioni, min 1
     return psycopg2.pool.SimpleConnectionPool(1, 10, dsn=db_url)
 
 def get_connection():
@@ -28,6 +28,16 @@ def release_connection(conn):
     pool = init_connection_pool()
     pool.putconn(conn)
 
+@contextmanager
+def get_db_connection():
+    """Context manager per ottenere e rilasciare automaticamente una connessione."""
+    conn = get_connection()
+    try:
+        yield conn
+    finally:
+        release_connection(conn)
+
+# ==================== INIT DATABASE ====================
 def init_db(conn):
     """Crea le tabelle se non esistono (sintassi PostgreSQL)."""
     cur = conn.cursor()
@@ -119,27 +129,6 @@ def init_db(conn):
         conn.commit()
     cur.close()
 
-def fix_commesse_anni(conn):
-    """Assegna un anno valido a tutte le commesse che ne sono sprovviste."""
-    anno_corrente = datetime.today().year
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM anni WHERE anno = %s", (anno_corrente,))
-    row = cur.fetchone()
-    if row:
-        anno_default = row[0]
-    else:
-        cur.execute("INSERT INTO anni (anno) VALUES (%s) RETURNING id", (anno_corrente,))
-        anno_default = cur.fetchone()[0]
-        conn.commit()
-    cur.execute("""
-        UPDATE commesse
-        SET anno_id = %s
-        WHERE anno_id IS NULL
-           OR anno_id NOT IN (SELECT id FROM anni)
-    """, (anno_default,))
-    conn.commit()
-    cur.close()
-
 def migra_database(conn):
     """Controlla se la colonna anno_id esiste e la crea se manca."""
     cur = conn.cursor()
@@ -160,46 +149,117 @@ def migra_database(conn):
         cur.execute("UPDATE commesse SET anno_id = %s WHERE anno_id IS NULL", (anno_id,))
         conn.commit()
     cur.close()
-    fix_commesse_anni(conn)
-
-# ==================== LOGIN / UTENTI ====================
-def verifica_login(conn, username, password):
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    # Assegna anno a commesse che non lo hanno
+    anno_corrente = datetime.today().year
     cur = conn.cursor()
-    cur.execute("SELECT * FROM utenti WHERE username=%s AND password_hash=%s AND attivo=1", (username, pw_hash))
-    user = cur.fetchone()
-    cur.close()
-    return user
-
-def ottieni_utenti_attivi(conn):
-    return pd.read_sql("SELECT username, nome, cognome FROM utenti WHERE attivo=1", conn)
-
-def ottieni_tutti_utenti(conn):
-    return pd.read_sql("SELECT * FROM utenti", conn)
-
-def aggiungi_utente(conn, username, password, nome, cognome, is_admin=0):
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO utenti (username, password_hash, nome, cognome, attivo, is_admin)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (username, pw_hash, nome, cognome, 1, is_admin))
+    cur.execute("SELECT id FROM anni WHERE anno = %s", (anno_corrente,))
+    row = cur.fetchone()
+    if row:
+        anno_default = row[0]
+    else:
+        cur.execute("INSERT INTO anni (anno) VALUES (%s) ON CONFLICT (anno) DO NOTHING RETURNING id", (anno_corrente,))
+        res = cur.fetchone()
+        if res is None:
+            cur.execute("SELECT id FROM anni WHERE anno = %s", (anno_corrente,))
+            anno_default = cur.fetchone()[0]
+        else:
+            anno_default = res[0]
         conn.commit()
-        return True, "Utente creato."
-    except psycopg2.IntegrityError:
-        conn.rollback()
-        return False, "Username già esistente."
-    finally:
-        cur.close()
-
-def aggiorna_stato_utente(conn, username, attivo):
-    cur = conn.cursor()
-    cur.execute("UPDATE utenti SET attivo=%s WHERE username=%s", (attivo, username))
+    cur.execute("""
+        UPDATE commesse
+        SET anno_id = %s
+        WHERE anno_id IS NULL
+           OR anno_id NOT IN (SELECT id FROM anni)
+    """, (anno_default,))
     conn.commit()
     cur.close()
 
-# ==================== CRONOLOGIA ====================
+# ==================== FUNZIONI DI ACCESSO DATI CON CACHING ====================
+# Usiamo st.cache_data per evitare di rieseguire query inutili durante la stessa sessione.
+# Il parametro ttl (time-to-live) può essere impostato per invalidare la cache dopo un po'.
+
+@st.cache_data(ttl=60)  # cache per 60 secondi, poi ricarica
+def get_utenti_attivi(conn):
+    return pd.read_sql("SELECT username, nome, cognome FROM utenti WHERE attivo=1", conn)
+
+@st.cache_data(ttl=60)
+def get_tutti_utenti(conn):
+    return pd.read_sql("SELECT * FROM utenti", conn)
+
+@st.cache_data(ttl=60)
+def get_anni(conn):
+    return pd.read_sql("SELECT * FROM anni ORDER BY anno DESC", conn)
+
+@st.cache_data(ttl=60)
+def get_tutte_commesse(conn):
+    return pd.read_sql("""
+        SELECT c.*, a.anno FROM commesse c
+        LEFT JOIN anni a ON c.anno_id = a.id
+        ORDER BY a.anno DESC, c.id
+    """, conn)
+
+@st.cache_data(ttl=60)
+def get_sottolavori_per_commessa(conn, commessa_id):
+    return pd.read_sql("SELECT * FROM sottolavori WHERE commessa_id=%s ORDER BY id", conn, params=(commessa_id,))
+
+@st.cache_data(ttl=60)
+def get_tutti_sottolavori(conn):
+    return pd.read_sql("""
+        SELECT s.*, c.nome as commessa_nome, c.numero_identificativo, a.anno
+        FROM sottolavori s
+        JOIN commesse c ON s.commessa_id = c.id
+        LEFT JOIN anni a ON c.anno_id = a.id
+        ORDER BY a.anno DESC, c.nome, s.nome
+    """, conn)
+
+@st.cache_data(ttl=60)
+def get_attivita_personali(conn, ingegnere=None):
+    if ingegnere:
+        return pd.read_sql("SELECT * FROM attivita_personali WHERE ingegnere=%s ORDER BY id", conn, params=(ingegnere,))
+    return pd.read_sql("SELECT * FROM attivita_personali ORDER BY id", conn)
+
+@st.cache_data(ttl=60)
+def get_sottolavori_per_ingegnere(conn, ingegnere):
+    return pd.read_sql("""
+        SELECT s.id, c.nome as commessa_nome, c.numero_identificativo,
+               s.nome as sottolavoro_nome, s.ingegnere_assegnato, s.stato, s.note
+        FROM sottolavori s
+        JOIN commesse c ON s.commessa_id = c.id
+        WHERE s.ingegnere_assegnato = %s
+        ORDER BY c.nome, s.nome
+    """, conn, params=(ingegnere,))
+
+@st.cache_data(ttl=60)
+def get_sottolavori_in_corso_per_ingegnere(conn, ingegnere):
+    return pd.read_sql("""
+        SELECT s.*, c.nome as commessa_nome, c.numero_identificativo, a.anno
+        FROM sottolavori s
+        JOIN commesse c ON s.commessa_id = c.id
+        LEFT JOIN anni a ON c.anno_id = a.id
+        WHERE s.ingegnere_assegnato = %s AND s.stato = 'In corso'
+    """, conn, params=(ingegnere,))
+
+@st.cache_data(ttl=60)
+def get_attivita_personali_in_corso(conn, ingegnere):
+    return pd.read_sql("SELECT * FROM attivita_personali WHERE ingegnere=%s AND stato='In corso'", conn, params=(ingegnere,))
+
+@st.cache_data(ttl=60)
+def get_commessa_by_id(conn, commessa_id):
+    return pd.read_sql("SELECT c.*, a.anno FROM commesse c LEFT JOIN anni a ON c.anno_id=a.id WHERE c.id=%s", conn, params=(commessa_id,))
+
+@st.cache_data(ttl=60)
+def get_count_commesse(conn):
+    return pd.read_sql("SELECT COUNT(*) FROM commesse", conn).iloc[0,0]
+
+@st.cache_data(ttl=60)
+def get_count_sottolavori_in_corso(conn):
+    return pd.read_sql("SELECT COUNT(*) FROM sottolavori WHERE stato='In corso'", conn).iloc[0,0]
+
+@st.cache_data(ttl=60)
+def get_count_attivita_personali_in_corso(conn):
+    return pd.read_sql("SELECT COUNT(*) FROM attivita_personali WHERE stato='In corso'", conn).iloc[0,0]
+
+# ==================== FUNZIONI DI MODIFICA (non cache) ====================
 def salva_cronologia(conn, entita_tipo, entita_id, dati_dict):
     cur = conn.cursor()
     cur.execute("""
@@ -209,9 +269,7 @@ def salva_cronologia(conn, entita_tipo, entita_id, dati_dict):
     conn.commit()
     cur.close()
 
-# ==================== CRUD ANNI ====================
 def ottieni_o_crea_anno(conn, anno):
-    """Restituisce l'id dell'anno, creandolo se non esiste."""
     try:
         anno_int = int(anno)
     except ValueError:
@@ -225,17 +283,12 @@ def ottieni_o_crea_anno(conn, anno):
     cur.execute("INSERT INTO anni (anno) VALUES (%s) ON CONFLICT (anno) DO NOTHING RETURNING id", (anno_int,))
     res = cur.fetchone()
     if res is None:
-        # Se il conflitto ha evitato l'inserimento, leggiamo l'id esistente
         cur.execute("SELECT id FROM anni WHERE anno=%s", (anno_int,))
         res = cur.fetchone()
     conn.commit()
     cur.close()
     return res[0] if res else None
 
-def leggi_anni(conn):
-    return pd.read_sql("SELECT * FROM anni ORDER BY anno DESC", conn)
-
-# ==================== CRUD COMMESSE ====================
 def aggiungi_commessa(conn, anno_id, nome, numero_id, data_inizio, data_fine_prevista):
     cur = conn.cursor()
     try:
@@ -248,6 +301,8 @@ def aggiungi_commessa(conn, anno_id, nome, numero_id, data_inizio, data_fine_pre
         conn.commit()
         dati = {"anno_id": anno_id, "nome": nome, "numero_identificativo": numero_id, "data_inizio": str(data_inizio)}
         salva_cronologia(conn, "commessa", nuova_id, dati)
+        # Invalida cache delle commesse
+        st.cache_data.clear()
         return True, "Commessa aggiunta."
     except psycopg2.IntegrityError:
         conn.rollback()
@@ -272,6 +327,7 @@ def aggiorna_commessa(conn, commessa_id, **campi):
         row = row.iloc[0]
         dati = {"id": row['id'], "nome": row['nome'], "numero_identificativo": row['numero_identificativo']}
         salva_cronologia(conn, "commessa", commessa_id, dati)
+    st.cache_data.clear()
     return True, "Commessa aggiornata."
 
 def elimina_commessa(conn, commessa_id):
@@ -279,15 +335,8 @@ def elimina_commessa(conn, commessa_id):
     cur.execute("DELETE FROM commesse WHERE id=%s", (commessa_id,))
     conn.commit()
     cur.close()
+    st.cache_data.clear()
 
-def leggi_tutte_commesse(conn):
-    return pd.read_sql("""
-        SELECT c.*, a.anno FROM commesse c
-        LEFT JOIN anni a ON c.anno_id = a.id
-        ORDER BY a.anno DESC, c.id
-    """, conn)
-
-# ==================== CRUD SOTTOLAVORI ====================
 def aggiungi_sottolavoro(conn, commessa_id, nome, ingegnere, data_inizio, data_fine_prevista, note, stato="In corso"):
     cur = conn.cursor()
     cur.execute("""
@@ -300,6 +349,7 @@ def aggiungi_sottolavoro(conn, commessa_id, nome, ingegnere, data_inizio, data_f
     cur.close()
     dati = {"commessa_id": commessa_id, "nome": nome, "ingegnere": ingegnere, "stato": stato}
     salva_cronologia(conn, "sottolavoro", nuova_id, dati)
+    st.cache_data.clear()
     return True, "Sottolavoro aggiunto."
 
 def aggiorna_sottolavoro(conn, sottolavoro_id, **campi):
@@ -318,6 +368,7 @@ def aggiorna_sottolavoro(conn, sottolavoro_id, **campi):
         row = row.iloc[0]
         dati = {"id": row['id'], "nome": row['nome'], "ingegnere": row['ingegnere_assegnato'], "stato": row['stato']}
         salva_cronologia(conn, "sottolavoro", sottolavoro_id, dati)
+    st.cache_data.clear()
     return True, "Sottolavoro aggiornato."
 
 def elimina_sottolavoro(conn, sottolavoro_id):
@@ -325,20 +376,8 @@ def elimina_sottolavoro(conn, sottolavoro_id):
     cur.execute("DELETE FROM sottolavori WHERE id=%s", (sottolavoro_id,))
     conn.commit()
     cur.close()
+    st.cache_data.clear()
 
-def leggi_sottolavori_per_commessa(conn, commessa_id):
-    return pd.read_sql("SELECT * FROM sottolavori WHERE commessa_id=%s ORDER BY id", conn, params=(commessa_id,))
-
-def leggi_tutti_sottolavori(conn):
-    return pd.read_sql("""
-        SELECT s.*, c.nome as commessa_nome, c.numero_identificativo, a.anno
-        FROM sottolavori s
-        JOIN commesse c ON s.commessa_id = c.id
-        LEFT JOIN anni a ON c.anno_id = a.id
-        ORDER BY a.anno DESC, c.nome, s.nome
-    """, conn)
-
-# ==================== ATTIVITÀ PERSONALI ====================
 def aggiungi_attivita_personale(conn, ingegnere, descrizione, data_inizio, data_fine_prevista, note, stato="In corso"):
     cur = conn.cursor()
     cur.execute("""
@@ -351,6 +390,7 @@ def aggiungi_attivita_personale(conn, ingegnere, descrizione, data_inizio, data_
     cur.close()
     dati = {"ingegnere": ingegnere, "descrizione": descrizione, "stato": stato}
     salva_cronologia(conn, "personale", nuova_id, dati)
+    st.cache_data.clear()
     return True, "Attività personale aggiunta."
 
 def aggiorna_attivita_personale(conn, att_id, **campi):
@@ -364,6 +404,7 @@ def aggiorna_attivita_personale(conn, att_id, **campi):
     cur.execute(f"UPDATE attivita_personali SET {set_clause} WHERE id=%s", valori)
     conn.commit()
     cur.close()
+    st.cache_data.clear()
     return True, "Aggiornato."
 
 def elimina_attivita_personale(conn, att_id):
@@ -371,13 +412,41 @@ def elimina_attivita_personale(conn, att_id):
     cur.execute("DELETE FROM attivita_personali WHERE id=%s", (att_id,))
     conn.commit()
     cur.close()
+    st.cache_data.clear()
 
-def leggi_attivita_personali(conn, ingegnere=None):
-    if ingegnere:
-        return pd.read_sql("SELECT * FROM attivita_personali WHERE ingegnere=%s ORDER BY id", conn, params=(ingegnere,))
-    return pd.read_sql("SELECT * FROM attivita_personali ORDER BY id", conn)
+def aggiungi_utente(conn, username, password, nome, cognome, is_admin=0):
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO utenti (username, password_hash, nome, cognome, attivo, is_admin)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (username, pw_hash, nome, cognome, 1, is_admin))
+        conn.commit()
+        st.cache_data.clear()
+        return True, "Utente creato."
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        return False, "Username già esistente."
+    finally:
+        cur.close()
 
-# ==================== STORICO ====================
+def aggiorna_stato_utente(conn, username, attivo):
+    cur = conn.cursor()
+    cur.execute("UPDATE utenti SET attivo=%s WHERE username=%s", (attivo, username))
+    conn.commit()
+    cur.close()
+    st.cache_data.clear()
+
+def verifica_login(conn, username, password):
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM utenti WHERE username=%s AND password_hash=%s AND attivo=1", (username, pw_hash))
+    user = cur.fetchone()
+    cur.close()
+    return user
+
+# ==================== FUNZIONI DI STORICO E GRAFICO ====================
 def stato_alla_data(conn, entita_tipo, entita_id, data_limite):
     cur = conn.cursor()
     cur.execute("""
@@ -393,23 +462,23 @@ def stato_alla_data(conn, entita_tipo, entita_id, data_limite):
 
 def tutte_entita_alla_data(conn, data_limite):
     commesse = []
-    for comm in leggi_tutte_commesse(conn).to_dict('records'):
+    for comm in get_tutte_commesse(conn).to_dict('records'):
         stato_prec = stato_alla_data(conn, "commessa", comm['id'], data_limite)
         if stato_prec:
             commesse.append(stato_prec)
     sottolavori = []
-    for sott in leggi_tutti_sottolavori(conn).to_dict('records'):
+    for sott in get_tutti_sottolavori(conn).to_dict('records'):
         stato_prec = stato_alla_data(conn, "sottolavoro", sott['id'], data_limite)
         if stato_prec:
             sottolavori.append(stato_prec)
     att_pers = []
-    for att in leggi_attivita_personali(conn).to_dict('records'):
+    for att in get_attivita_personali(conn).to_dict('records'):
         stato_prec = stato_alla_data(conn, "personale", att['id'], data_limite)
         if stato_prec:
             att_pers.append(stato_prec)
     return commesse, sottolavori, att_pers
 
-# ==================== GRAFICO ====================
+@st.cache_data(ttl=60)
 def prepara_dati_grafico(conn, ingegnere=None):
     sott = pd.read_sql("""
         SELECT ingegnere_assegnato as ingegnere, data_inizio, data_fine_effettiva, stato
@@ -442,12 +511,12 @@ def prepara_dati_grafico(conn, ingegnere=None):
 def esporta_excel(conn):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        leggi_anni(conn).to_excel(writer, sheet_name='Anni', index=False)
-        leggi_tutte_commesse(conn).to_excel(writer, sheet_name='Commesse', index=False)
-        leggi_tutti_sottolavori(conn).to_excel(writer, sheet_name='Sottolavori', index=False)
-        leggi_attivita_personali(conn).to_excel(writer, sheet_name='Attività_Personali', index=False)
+        get_anni(conn).to_excel(writer, sheet_name='Anni', index=False)
+        get_tutte_commesse(conn).to_excel(writer, sheet_name='Commesse', index=False)
+        get_tutti_sottolavori(conn).to_excel(writer, sheet_name='Sottolavori', index=False)
+        get_attivita_personali(conn).to_excel(writer, sheet_name='Attività_Personali', index=False)
         pd.read_sql("SELECT * FROM cronologia", conn).to_excel(writer, sheet_name='Cronologia', index=False)
-        ottieni_tutti_utenti(conn).to_excel(writer, sheet_name='Utenti', index=False)
+        get_tutti_utenti(conn).to_excel(writer, sheet_name='Utenti', index=False)
     return output.getvalue()
 
 # ==================== INTERFACCIA ====================
@@ -478,731 +547,635 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    conn = get_connection()
-    init_db(conn)
-    migra_database(conn)
+    with get_db_connection() as conn:
+        init_db(conn)
+        migra_database(conn)
 
-    if 'autenticato' not in st.session_state or not st.session_state['autenticato']:
-        pagina_login(conn)
-        release_connection(conn)
-        return
+        if 'autenticato' not in st.session_state or not st.session_state['autenticato']:
+            pagina_login(conn)
+            return
 
-    st.sidebar.title(f"👤 {st.session_state['nome_completo']}")
-    if st.sidebar.button("Logout"):
-        st.session_state.clear()
-        st.rerun()
-    st.sidebar.markdown("---")
+        st.sidebar.title(f"👤 {st.session_state['nome_completo']}")
+        if st.sidebar.button("Logout"):
+            st.session_state.clear()
+            st.rerun()
+        st.sidebar.markdown("---")
 
-    menu_options = ["Commesse", "Attività Personali", "Resoconto", "Backup"]
-    if st.session_state['is_admin']:
-        menu_options.append("Amministrazione Utenti")
-    scelta = st.sidebar.radio("Naviga", menu_options)
+        menu_options = ["Commesse", "Attività Personali", "Resoconto", "Backup"]
+        if st.session_state['is_admin']:
+            menu_options.append("Amministrazione Utenti")
+        scelta = st.sidebar.radio("Naviga", menu_options)
 
-    # -------------------- DASHBOARD --------------------
-    if scelta == "Dashboard":
-        st.header("📊 Dashboard Lavori")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            n_commesse = pd.read_sql("SELECT COUNT(*) FROM commesse", conn).iloc[0,0]
-            st.markdown(f'<div class="metric-card"><h3>{n_commesse}</h3><p>Commesse totali</p></div>', unsafe_allow_html=True)
-        with col2:
-            n_sott = pd.read_sql("SELECT COUNT(*) FROM sottolavori WHERE stato='In corso'", conn).iloc[0,0]
-            st.markdown(f'<div class="metric-card"><h3>{n_sott}</h3><p>Sottolavori in corso</p></div>', unsafe_allow_html=True)
-        with col3:
-            n_pers = pd.read_sql("SELECT COUNT(*) FROM attivita_personali WHERE stato='In corso'", conn).iloc[0,0]
-            st.markdown(f'<div class="metric-card"><h3>{n_pers}</h3><p>Attività personali in corso</p></div>', unsafe_allow_html=True)
+        # -------------------- DASHBOARD --------------------
+        if scelta == "Dashboard":
+            st.header("📊 Dashboard Lavori")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                n_commesse = get_count_commesse(conn)
+                st.markdown(f'<div class="metric-card"><h3>{n_commesse}</h3><p>Commesse totali</p></div>', unsafe_allow_html=True)
+            with col2:
+                n_sott = get_count_sottolavori_in_corso(conn)
+                st.markdown(f'<div class="metric-card"><h3>{n_sott}</h3><p>Sottolavori in corso</p></div>', unsafe_allow_html=True)
+            with col3:
+                n_pers = get_count_attivita_personali_in_corso(conn)
+                st.markdown(f'<div class="metric-card"><h3>{n_pers}</h3><p>Attività personali in corso</p></div>', unsafe_allow_html=True)
 
-        st.subheader("📈 Andamento lavori (nuovi vs completati)")
-        ingegneri = ottieni_utenti_attivi(conn)['username'].tolist()
-        ing_sel = st.selectbox("Seleziona ingegnere", ["Tutti"] + ingegneri)
-        df_grafico = prepara_dati_grafico(conn, ing_sel if ing_sel != "Tutti" else None)
-        if not df_grafico.empty:
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=df_grafico['mese'], y=df_grafico['nuovi_incarichi'], name='Nuovi incarichi', marker_color='#17a2b8'))
-            fig.add_trace(go.Bar(x=df_grafico['mese'], y=df_grafico['completati'], name='Completati', marker_color='#28a745'))
-            fig.update_layout(barmode='group', xaxis_title='Mese', yaxis_title='Numero')
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Nessun dato disponibile per il grafico.")
+            st.subheader("📈 Andamento lavori (nuovi vs completati)")
+            ingegneri = get_utenti_attivi(conn)['username'].tolist()
+            ing_sel = st.selectbox("Seleziona ingegnere", ["Tutti"] + ingegneri)
+            df_grafico = prepara_dati_grafico(conn, ing_sel if ing_sel != "Tutti" else None)
+            if not df_grafico.empty:
+                fig = go.Figure()
+                fig.add_trace(go.Bar(x=df_grafico['mese'], y=df_grafico['nuovi_incarichi'], name='Nuovi incarichi', marker_color='#17a2b8'))
+                fig.add_trace(go.Bar(x=df_grafico['mese'], y=df_grafico['completati'], name='Completati', marker_color='#28a745'))
+                fig.update_layout(barmode='group', xaxis_title='Mese', yaxis_title='Numero')
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Nessun dato disponibile per il grafico.")
 
-    # -------------------- SEZIONE COMMESSE --------------------
-    elif scelta == "Commesse":
-        st.header("📁 Gestione Commesse")
-        ingegneri_attivi = ottieni_utenti_attivi(conn)['username'].tolist()
+        # -------------------- SEZIONE COMMESSE --------------------
+        elif scelta == "Commesse":
+            st.header("📁 Gestione Commesse")
+            ingegneri_attivi = get_utenti_attivi(conn)['username'].tolist()
 
-        if 'selected_commessa_id' not in st.session_state:
-            st.session_state.selected_commessa_id = None
-        if 'show_delete_dialog' not in st.session_state:
-            st.session_state.show_delete_dialog = None
+            if 'selected_commessa_id' not in st.session_state:
+                st.session_state.selected_commessa_id = None
+            if 'show_delete_dialog' not in st.session_state:
+                st.session_state.show_delete_dialog = None
 
-        # Box di conferma eliminazione
-        if st.session_state.show_delete_dialog is not None:
-            with st.container():
-                st.markdown("---")
-                st.warning("⚠️ Vuoi davvero eliminare questa commessa? Tutti i suoi sottolavori andranno persi.")
-                col_confirm, col_cancel = st.columns(2)
-                if col_confirm.button("🗑️ Elimina", key="exec_delete_commessa"):
-                    elimina_commessa(conn, st.session_state.show_delete_dialog)
-                    if st.session_state.selected_commessa_id == st.session_state.show_delete_dialog:
-                        st.session_state.selected_commessa_id = None
-                    st.session_state.show_delete_dialog = None
-                    st.rerun()
-                if col_cancel.button("Annulla", key="cancel_delete_commessa"):
-                    st.session_state.show_delete_dialog = None
-                    st.rerun()
+            # Box di conferma eliminazione
+            if st.session_state.show_delete_dialog is not None:
+                with st.container():
+                    st.markdown("---")
+                    st.warning("⚠️ Vuoi davvero eliminare questa commessa? Tutti i suoi sottolavori andranno persi.")
+                    col_confirm, col_cancel = st.columns(2)
+                    if col_confirm.button("🗑️ Elimina", key="exec_delete_commessa"):
+                        elimina_commessa(conn, st.session_state.show_delete_dialog)
+                        if st.session_state.selected_commessa_id == st.session_state.show_delete_dialog:
+                            st.session_state.selected_commessa_id = None
+                        st.session_state.show_delete_dialog = None
+                        st.rerun()
+                    if col_cancel.button("Annulla", key="cancel_delete_commessa"):
+                        st.session_state.show_delete_dialog = None
+                        st.rerun()
 
-        # Tab per Albero, Riepilogo e Ingegneri
-        tab_albero, tab_riepilogo, tab_ingegneri = st.tabs(["🛠️ Lavori", "📋 Riepilogo", "👷 Ingegneri"])
+            tab_albero, tab_riepilogo, tab_ingegneri = st.tabs(["🛠️ Lavori", "📋 Riepilogo", "👷 Ingegneri"])
 
-        # ==================== TAB ALBERO ====================
-        with tab_albero:
-            # Form per nuova commessa (compatto)
-            with st.expander("➕ Nuova Commessa", expanded=False):
-                with st.form("crea_commessa_form", clear_on_submit=True):
-                    col1, col2, col3, col4, col5 = st.columns(5)
-                    with col1:
-                        anno_input = st.text_input("Anno *", value=str(datetime.today().year))
-                    with col2:
-                        num_id = st.text_input("Numero identificativo *")
-                    with col3:
-                        nome_comm = st.text_input("Nome commessa *")
-                    with col4:
-                        data_in = st.date_input("Data inizio", datetime.today())
-                    with col5:
-                        data_fine = st.date_input("Data fine prevista")
-                    submitted = st.form_submit_button("Crea commessa")
-                    if submitted:
-                        if not nome_comm or not num_id or not anno_input.strip():
-                            st.error("I campi contrassegnati con * sono obbligatori.")
-                        else:
-                            anno_id = ottieni_o_crea_anno(conn, anno_input.strip())
-                            if anno_id is None:
-                                st.error("L'anno deve essere un numero valido.")
+            # ==================== TAB ALBERO ====================
+            with tab_albero:
+                with st.expander("➕ Nuova Commessa", expanded=False):
+                    with st.form("crea_commessa_form", clear_on_submit=True):
+                        col1, col2, col3, col4, col5 = st.columns(5)
+                        with col1:
+                            anno_input = st.text_input("Anno *", value=str(datetime.today().year))
+                        with col2:
+                            num_id = st.text_input("Numero identificativo *")
+                        with col3:
+                            nome_comm = st.text_input("Nome commessa *")
+                        with col4:
+                            data_in = st.date_input("Data inizio", datetime.today())
+                        with col5:
+                            data_fine = st.date_input("Data fine prevista")
+                        submitted = st.form_submit_button("Crea commessa")
+                        if submitted:
+                            if not nome_comm or not num_id or not anno_input.strip():
+                                st.error("I campi contrassegnati con * sono obbligatori.")
                             else:
-                                ok, msg = aggiungi_commessa(conn, anno_id, nome_comm, num_id, data_in, data_fine)
-                                if ok:
-                                    st.success(msg)
-                                    st.rerun()
+                                anno_id = ottieni_o_crea_anno(conn, anno_input.strip())
+                                if anno_id is None:
+                                    st.error("L'anno deve essere un numero valido.")
                                 else:
-                                    st.error(msg)
-
-            st.markdown("---")
-
-            col_albero, col_dettaglio = st.columns([1, 3])
-
-            # ---------------- COLONNA ALBERO ----------------
-            with col_albero:
-                st.subheader("🗂️ Commesse")
-                search_query = st.text_input("🔍 Cerca commessa", placeholder="Nome o numero...", key="search_albero")
-
-                col_espandi, col_collassa = st.columns(2)
-                with col_espandi:
-                    if st.button("📂 Espandi tutti", key="expand_all"):
-                        tutte = leggi_tutte_commesse(conn)
-                        for _, row in tutte.iterrows():
-                            st.session_state[f"exp_comm_{row['id']}"] = True
-                        st.rerun()
-                with col_collassa:
-                    if st.button("📁 Collassa tutti", key="collapse_all"):
-                        tutte = leggi_tutte_commesse(conn)
-                        for _, row in tutte.iterrows():
-                            st.session_state[f"exp_comm_{row['id']}"] = False
-                        st.rerun()
-
-                tutte_commesse = leggi_tutte_commesse(conn)
-                if not tutte_commesse.empty:
-                    if search_query.strip():
-                        query = search_query.strip().lower()
-                        filtered = tutte_commesse[
-                            tutte_commesse['nome'].str.lower().str.contains(query) |
-                            tutte_commesse['numero_identificativo'].str.lower().str.contains(query)
-                        ]
-                    else:
-                        filtered = tutte_commesse
-
-                    if filtered.empty:
-                        st.info("Nessuna commessa trovata.")
-                    else:
-                        for _, comm_row in filtered.iterrows():
-                            comm_id = comm_row['id']
-                            sott_comm = leggi_sottolavori_per_commessa(conn, comm_id)
-                            totale = len(sott_comm)
-                            completati = len(sott_comm[sott_comm['stato'] == 'Completato']) if totale > 0 else 0
-                            pallino = "🟢" if totale > 0 and completati == totale else "🔴"
-                            anno_str = f" ({int(comm_row['anno'])})" if pd.notna(comm_row['anno']) else ""
-                            label_comm = f"{pallino} {comm_row['numero_identificativo']} - {comm_row['nome']}{anno_str}"
-
-                            if f"exp_comm_{comm_id}" not in st.session_state:
-                                st.session_state[f"exp_comm_{comm_id}"] = False
-
-                            col_toggle, col_name, col_del = st.columns([0.08, 0.82, 0.1])
-                            with col_toggle:
-                                if st.button("▾" if st.session_state[f"exp_comm_{comm_id}"] else "▸",
-                                             key=f"tog_comm_{comm_id}"):
-                                    st.session_state[f"exp_comm_{comm_id}"] = not st.session_state[f"exp_comm_{comm_id}"]
-                                    st.rerun()
-                            with col_name:
-                                if st.button(label_comm, key=f"sel_{comm_id}"):
-                                    st.session_state.selected_commessa_id = comm_id
-                                    st.rerun()
-                            with col_del:
-                                if st.button("🗑️", key=f"del_comm_{comm_id}"):
-                                    st.session_state.show_delete_dialog = comm_id
-                                    st.rerun()
-
-                            if st.session_state[f"exp_comm_{comm_id}"] and not sott_comm.empty:
-                                tree_html = '<div style="margin-left: 40px; border-left: 1px solid #aaa; padding-left: 15px;">'
-                                for j, (_, sott_row) in enumerate(sott_comm.iterrows()):
-                                    pallino_sl = "🟢" if sott_row['stato'] == 'Completato' else "🔴"
-                                    stato_str = sott_row['stato']
-                                    ing_str = sott_row['ingegnere_assegnato']
-                                    nome_sl = sott_row['nome']
-                                    ramo = "└─" if j == len(sott_comm)-1 else "├─"
-                                    tree_html += f"<div style='margin:2px 0;'><span style='font-family: monospace;'>{ramo} {pallino_sl} {nome_sl} ({stato_str}) - Ing. {ing_str}</span></div>"
-                                tree_html += '</div>'
-                                st.markdown(tree_html, unsafe_allow_html=True)
-                else:
-                    st.info("Nessuna commessa presente. Creane una con il pulsante sopra.")
-
-            # ---------------- COLONNA DETTAGLIO: TABELLA SOTTOLAVORI ----------------
-            with col_dettaglio:
-                if st.session_state.selected_commessa_id is None:
-                    st.info("Clicca sul nome di una commessa nell'albero per visualizzare/modificare i sottolavori.")
-                else:
-                    comm_id = st.session_state.selected_commessa_id
-                    df_comm = pd.read_sql("SELECT c.*, a.anno FROM commesse c LEFT JOIN anni a ON c.anno_id=a.id WHERE c.id=%s", conn, params=(comm_id,))
-                    if df_comm.empty:
-                        st.warning("Commessa non trovata.")
-                        st.session_state.selected_commessa_id = None
-                        st.rerun()
-
-                    comm_row = df_comm.iloc[0]
-
-                    # --- Modalità modifica (numero, nome, anno, note) attivata con la matita ---
-                    if f"edit_commessa_{comm_id}" not in st.session_state:
-                        st.session_state[f"edit_commessa_{comm_id}"] = False
-
-                    if st.session_state[f"edit_commessa_{comm_id}"]:
-                        # Form di modifica unificato
-                        with st.form(key=f"mod_commessa_{comm_id}"):
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                nuovo_numero = st.text_input("Numero identificativo", value=comm_row['numero_identificativo'])
-                            with col2:
-                                nuovo_nome = st.text_input("Nome commessa", value=comm_row['nome'])
-
-                            # Anno
-                            anno_corrente = int(comm_row['anno']) if pd.notna(comm_row['anno']) else datetime.today().year
-                            nuovo_anno = st.text_input("Anno", value=str(anno_corrente))
-
-                            # Note
-                            note_correnti = comm_row['note'] if comm_row['note'] else ""
-                            nuove_note = st.text_area("Note", value=note_correnti, height=100)
-
-                            col_salva, col_annulla = st.columns(2)
-                            with col_salva:
-                                if st.form_submit_button("💾 Salva modifiche"):
-                                    if not nuovo_numero or not nuovo_nome or not nuovo_anno.strip():
-                                        st.error("I campi numero, nome e anno sono obbligatori.")
+                                    ok, msg = aggiungi_commessa(conn, anno_id, nome_comm, num_id, data_in, data_fine)
+                                    if ok:
+                                        st.success(msg)
+                                        st.rerun()
                                     else:
-                                        anno_id = ottieni_o_crea_anno(conn, nuovo_anno.strip())
-                                        if anno_id is None:
-                                            st.error("L'anno deve essere un numero valido.")
+                                        st.error(msg)
+
+                st.markdown("---")
+                col_albero, col_dettaglio = st.columns([1, 3])
+
+                # ---------------- COLONNA ALBERO ----------------
+                with col_albero:
+                    st.subheader("🗂️ Commesse")
+                    search_query = st.text_input("🔍 Cerca commessa", placeholder="Nome o numero...", key="search_albero")
+
+                    col_espandi, col_collassa = st.columns(2)
+                    with col_espandi:
+                        if st.button("📂 Espandi tutti", key="expand_all"):
+                            tutte = get_tutte_commesse(conn)
+                            for _, row in tutte.iterrows():
+                                st.session_state[f"exp_comm_{row['id']}"] = True
+                            st.rerun()
+                    with col_collassa:
+                        if st.button("📁 Collassa tutti", key="collapse_all"):
+                            tutte = get_tutte_commesse(conn)
+                            for _, row in tutte.iterrows():
+                                st.session_state[f"exp_comm_{row['id']}"] = False
+                            st.rerun()
+
+                    tutte_commesse = get_tutte_commesse(conn)
+                    if not tutte_commesse.empty:
+                        if search_query.strip():
+                            query = search_query.strip().lower()
+                            filtered = tutte_commesse[
+                                tutte_commesse['nome'].str.lower().str.contains(query) |
+                                tutte_commesse['numero_identificativo'].str.lower().str.contains(query)
+                            ]
+                        else:
+                            filtered = tutte_commesse
+
+                        if filtered.empty:
+                            st.info("Nessuna commessa trovata.")
+                        else:
+                            for _, comm_row in filtered.iterrows():
+                                comm_id = comm_row['id']
+                                sott_comm = get_sottolavori_per_commessa(conn, comm_id)
+                                totale = len(sott_comm)
+                                completati = len(sott_comm[sott_comm['stato'] == 'Completato']) if totale > 0 else 0
+                                pallino = "🟢" if totale > 0 and completati == totale else "🔴"
+                                anno_str = f" ({int(comm_row['anno'])})" if pd.notna(comm_row['anno']) else ""
+                                label_comm = f"{pallino} {comm_row['numero_identificativo']} - {comm_row['nome']}{anno_str}"
+
+                                if f"exp_comm_{comm_id}" not in st.session_state:
+                                    st.session_state[f"exp_comm_{comm_id}"] = False
+
+                                col_toggle, col_name, col_del = st.columns([0.08, 0.82, 0.1])
+                                with col_toggle:
+                                    if st.button("▾" if st.session_state[f"exp_comm_{comm_id}"] else "▸",
+                                                 key=f"tog_comm_{comm_id}"):
+                                        st.session_state[f"exp_comm_{comm_id}"] = not st.session_state[f"exp_comm_{comm_id}"]
+                                        st.rerun()
+                                with col_name:
+                                    if st.button(label_comm, key=f"sel_{comm_id}"):
+                                        st.session_state.selected_commessa_id = comm_id
+                                        st.rerun()
+                                with col_del:
+                                    if st.button("🗑️", key=f"del_comm_{comm_id}"):
+                                        st.session_state.show_delete_dialog = comm_id
+                                        st.rerun()
+
+                                if st.session_state[f"exp_comm_{comm_id}"] and not sott_comm.empty:
+                                    tree_html = '<div style="margin-left: 40px; border-left: 1px solid #aaa; padding-left: 15px;">'
+                                    for j, (_, sott_row) in enumerate(sott_comm.iterrows()):
+                                        pallino_sl = "🟢" if sott_row['stato'] == 'Completato' else "🔴"
+                                        stato_str = sott_row['stato']
+                                        ing_str = sott_row['ingegnere_assegnato']
+                                        nome_sl = sott_row['nome']
+                                        ramo = "└─" if j == len(sott_comm)-1 else "├─"
+                                        tree_html += f"<div style='margin:2px 0;'><span style='font-family: monospace;'>{ramo} {pallino_sl} {nome_sl} ({stato_str}) - Ing. {ing_str}</span></div>"
+                                    tree_html += '</div>'
+                                    st.markdown(tree_html, unsafe_allow_html=True)
+                    else:
+                        st.info("Nessuna commessa presente. Creane una con il pulsante sopra.")
+
+                # ---------------- COLONNA DETTAGLIO ----------------
+                with col_dettaglio:
+                    if st.session_state.selected_commessa_id is None:
+                        st.info("Clicca sul nome di una commessa nell'albero per visualizzare/modificare i sottolavori.")
+                    else:
+                        comm_id = st.session_state.selected_commessa_id
+                        df_comm = get_commessa_by_id(conn, comm_id)
+                        if df_comm.empty:
+                            st.warning("Commessa non trovata.")
+                            st.session_state.selected_commessa_id = None
+                            st.rerun()
+
+                        comm_row = df_comm.iloc[0]
+
+                        if f"edit_commessa_{comm_id}" not in st.session_state:
+                            st.session_state[f"edit_commessa_{comm_id}"] = False
+
+                        if st.session_state[f"edit_commessa_{comm_id}"]:
+                            with st.form(key=f"mod_commessa_{comm_id}"):
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    nuovo_numero = st.text_input("Numero identificativo", value=comm_row['numero_identificativo'])
+                                with col2:
+                                    nuovo_nome = st.text_input("Nome commessa", value=comm_row['nome'])
+                                anno_corrente = int(comm_row['anno']) if pd.notna(comm_row['anno']) else datetime.today().year
+                                nuovo_anno = st.text_input("Anno", value=str(anno_corrente))
+                                note_correnti = comm_row['note'] if comm_row['note'] else ""
+                                nuove_note = st.text_area("Note", value=note_correnti, height=100)
+                                col_salva, col_annulla = st.columns(2)
+                                with col_salva:
+                                    if st.form_submit_button("💾 Salva modifiche"):
+                                        if not nuovo_numero or not nuovo_nome or not nuovo_anno.strip():
+                                            st.error("I campi numero, nome e anno sono obbligatori.")
                                         else:
-                                            # Aggiorna i campi della commessa
-                                            aggiorna_commessa(conn, comm_id,
-                                                nome=nuovo_nome,
-                                                numero_identificativo=nuovo_numero,
-                                                note=nuove_note)
-                                            # Aggiorna anche l'anno_id
-                                            cur = conn.cursor()
-                                            cur.execute("UPDATE commesse SET anno_id = %s WHERE id = %s", (anno_id, comm_id))
-                                            conn.commit()
-                                            cur.close()
-                                            st.success("Commessa aggiornata")
-                                            st.session_state[f"edit_commessa_{comm_id}"] = False
-                                            st.rerun()
-                            with col_annulla:
-                                if st.form_submit_button("Annulla"):
-                                    st.session_state[f"edit_commessa_{comm_id}"] = False
+                                            anno_id = ottieni_o_crea_anno(conn, nuovo_anno.strip())
+                                            if anno_id is None:
+                                                st.error("L'anno deve essere un numero valido.")
+                                            else:
+                                                aggiorna_commessa(conn, comm_id,
+                                                    nome=nuovo_nome,
+                                                    numero_identificativo=nuovo_numero,
+                                                    note=nuove_note)
+                                                cur = conn.cursor()
+                                                cur.execute("UPDATE commesse SET anno_id = %s WHERE id = %s", (anno_id, comm_id))
+                                                conn.commit()
+                                                cur.close()
+                                                st.success("Commessa aggiornata")
+                                                st.session_state[f"edit_commessa_{comm_id}"] = False
+                                                st.rerun()
+                                with col_annulla:
+                                    if st.form_submit_button("Annulla"):
+                                        st.session_state[f"edit_commessa_{comm_id}"] = False
+                                        st.rerun()
+                        else:
+                            col_titolo, col_edit = st.columns([0.95, 0.05])
+                            with col_titolo:
+                                st.subheader(f"📁 {comm_row['numero_identificativo']} - {comm_row['nome']}")
+                            with col_edit:
+                                if st.button("✏️", key=f"edit_btn_{comm_id}"):
+                                    st.session_state[f"edit_commessa_{comm_id}"] = True
                                     st.rerun()
-                    else:
-                        # Visualizzazione normale con icona matita
-                        col_titolo, col_edit = st.columns([0.95, 0.05])
-                        with col_titolo:
-                            st.subheader(f"📁 {comm_row['numero_identificativo']} - {comm_row['nome']}")
-                        with col_edit:
-                            if st.button("✏️", key=f"edit_btn_{comm_id}"):
-                                st.session_state[f"edit_commessa_{comm_id}"] = True
-                                st.rerun()
 
-                    # Mostra l'anno e le note (se presenti) anche fuori dalla modalità modifica
-                    anno_str = f"Anno: {int(comm_row['anno'])}" if pd.notna(comm_row['anno']) else "Anno: n/d"
-                    st.caption(anno_str)
-                    if comm_row['note']:
-                        st.caption(f"Note: {comm_row['note']}")
+                        anno_str = f"Anno: {int(comm_row['anno'])}" if pd.notna(comm_row['anno']) else "Anno: n/d"
+                        st.caption(anno_str)
+                        if comm_row['note']:
+                            st.caption(f"Note: {comm_row['note']}")
 
-                    # --- Editor sottolavori (invariato) ---
-                    sott_df = leggi_sottolavori_per_commessa(conn, comm_id)
-                    if sott_df.empty:
-                        sott_df = pd.DataFrame(columns=['id', 'nome', 'ingegnere_assegnato', 'stato', 'data_inizio', 'data_fine_prevista', 'note'])
-                    else:
-                        sott_df = sott_df.copy()
-                    sott_df['id'] = sott_df['id'].astype(int)
-                    editor_df = sott_df[['id', 'nome', 'ingegnere_assegnato', 'stato', 'data_fine_prevista', 'note']].copy()
-                    editor_df.columns = ['id', 'Nome', 'Ingegnere', 'Stato', 'Scadenza', 'Note']
-                    editor_df['Scadenza'] = editor_df['Scadenza'].astype(str)
-                    stato_options = ["In corso", "Completato", "In attesa"]
+                        # Editor sottolavori
+                        sott_df = get_sottolavori_per_commessa(conn, comm_id)
+                        if sott_df.empty:
+                            sott_df = pd.DataFrame(columns=['id', 'nome', 'ingegnere_assegnato', 'stato', 'data_inizio', 'data_fine_prevista', 'note'])
+                        else:
+                            sott_df = sott_df.copy()
+                        sott_df['id'] = sott_df['id'].astype(int)
+                        editor_df = sott_df[['id', 'nome', 'ingegnere_assegnato', 'stato', 'data_fine_prevista', 'note']].copy()
+                        editor_df.columns = ['id', 'Nome', 'Ingegnere', 'Stato', 'Scadenza', 'Note']
+                        editor_df['Scadenza'] = editor_df['Scadenza'].astype(str)
+                        stato_options = ["In corso", "Completato", "In attesa"]
 
-                    st.markdown("**Sottolavori (modifica direttamente, aggiungi righe in fondo)**")
-                    edited_df = st.data_editor(
-                        editor_df,
-                        num_rows="dynamic",
+                        st.markdown("**Sottolavori (modifica direttamente, aggiungi righe in fondo)**")
+                        edited_df = st.data_editor(
+                            editor_df,
+                            num_rows="dynamic",
+                            column_config={
+                                "id": None,
+                                "Stato": st.column_config.SelectboxColumn(
+                                    "Stato",
+                                    options=stato_options,
+                                    default="In corso"
+                                ),
+                                "Ingegnere": st.column_config.SelectboxColumn(
+                                    "Ingegnere",
+                                    options=ingegneri_attivi,
+                                    default=ingegneri_attivi[0] if ingegneri_attivi else None
+                                ),
+                                "Scadenza": st.column_config.TextColumn("Scadenza"),
+                                "Note": st.column_config.TextColumn("Note"),
+                            },
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        if st.button("💾 Salva modifiche sottolavori"):
+                            edited_df['id'] = pd.to_numeric(edited_df['id'], errors='coerce').fillna(0).astype(int)
+                            original_ids = set(sott_df['id'].tolist()) if not sott_df.empty else set()
+                            edited_ids = set()
+                            for _, row in edited_df.iterrows():
+                                rid = row['id']
+                                if rid != 0:
+                                    edited_ids.add(rid)
+                            to_delete = original_ids - edited_ids
+                            for del_id in to_delete:
+                                elimina_sottolavoro(conn, int(del_id))
+                            for _, row in edited_df.iterrows():
+                                rid = row['id']
+                                nome = row['Nome'] if not pd.isna(row['Nome']) else None
+                                ing = row['Ingegnere']
+                                stato = row['Stato']
+                                scadenza = row['Scadenza'] if pd.notna(row['Scadenza']) and row['Scadenza'] != '' else None
+                                note = row['Note'] if pd.notna(row['Note']) else None
+                                if rid == 0:
+                                    if nome:
+                                        aggiungi_sottolavoro(conn, comm_id, nome, ing, datetime.today().strftime("%Y-%m-%d"), scadenza, note, stato)
+                                else:
+                                    if nome:
+                                        aggiorna_sottolavoro(conn, int(rid), nome=nome, ingegnere_assegnato=ing, stato=stato,
+                                                            data_fine_prevista=scadenza, note=note,
+                                                            data_fine_effettiva=datetime.today().strftime("%Y-%m-%d") if stato == "Completato" else None)
+                            st.success("Sottolavori aggiornati.")
+                            st.rerun()
+
+            # ==================== TAB RIEPILOGO ====================
+            with tab_riepilogo:
+                st.subheader("📋 Riepilogo globale sottolavori")
+                riepilogo_df = get_tutti_sottolavori(conn)
+                if not riepilogo_df.empty:
+                    df_rip = riepilogo_df[['anno', 'commessa_nome', 'numero_identificativo',
+                                           'nome', 'ingegnere_assegnato', 'stato', 'note']].copy()
+                    df_rip.columns = ['Anno', 'Commessa', 'ID Commessa', 'Sottolavoro', 'Ingegnere', 'Stato', 'Note']
+                    df_rip['_gruppo'] = df_rip['ID Commessa'].astype(str) + " - " + df_rip['Commessa']
+                    df_rip = df_rip.sort_values(by=['Anno', '_gruppo'])
+                    df_display = df_rip.drop(columns=['_gruppo'])
+
+                    def color_stato(val):
+                        colors = {
+                            "Completato": "background-color: #d4edda; color: #155724",
+                            "In corso": "background-color: #f8d7da; color: #721c24",
+                            "In attesa": "background-color: #fff3cd; color: #856404"
+                        }
+                        return colors.get(val, "")
+
+                    styled_df = df_display.style.map(color_stato, subset=['Stato'])
+                    col_tabella, col_grafico = st.columns([2, 1])
+
+                    with col_tabella:
+                        st.markdown("""
+                        <style>
+                        .dataframe-container table td { padding: 2px 4px !important; font-size: 0.8rem !important; }
+                        .dataframe-container table th:nth-child(1), .dataframe-container table td:nth-child(1) { width: 30px !important; max-width: 30px !important; }
+                        .dataframe-container table th:not(:last-child), .dataframe-container table td:not(:last-child) { max-width: 80px; width: 80px; }
+                        .dataframe-container table th:last-child, .dataframe-container table td:last-child { min-width: 200px; }
+                        </style>
+                        """, unsafe_allow_html=True)
+                        st.dataframe(styled_df, width='stretch', height=800, hide_index=True)
+
+                    with col_grafico:
+                        st.subheader("📊 Stato lavori")
+                        conteggi_stato = df_rip['Stato'].value_counts()
+                        for stato in ["Completato", "In corso", "In attesa"]:
+                            if stato not in conteggi_stato:
+                                conteggi_stato[stato] = 0
+                        conteggi_stato = conteggi_stato.reindex(["Completato", "In corso", "In attesa"])
+                        fig1 = go.Figure(data=[go.Pie(
+                            labels=conteggi_stato.index,
+                            values=conteggi_stato.values,
+                            hole=0.3,
+                            marker=dict(colors=['#28a745', '#dc3545', '#ffc107'])
+                        )])
+                        fig1.update_layout(margin=dict(t=0, b=0, l=0, r=0), height=300,
+                                          legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.05))
+                        st.plotly_chart(fig1, use_container_width=True)
+
+                        st.subheader("👷‍♂️ Lavori per ingegnere")
+                        conteggi_ing = df_rip['Ingegnere'].value_counts()
+                        fig2 = go.Figure(data=[go.Pie(
+                            labels=conteggi_ing.index,
+                            values=conteggi_ing.values,
+                            hole=0.3,
+                            marker=dict(colors=px.colors.qualitative.Set2)
+                        )])
+                        fig2.update_layout(margin=dict(t=0, b=0, l=0, r=0), height=300,
+                                          legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.05))
+                        st.plotly_chart(fig2, use_container_width=True)
+                else:
+                    st.info("Nessun sottolavoro presente.")
+
+            # ==================== TAB INGEGNERI ====================
+            with tab_ingegneri:
+                st.subheader("👷 Mansioni per ingegnere")
+                utente_corrente = st.session_state['username']
+                is_admin = st.session_state['is_admin']
+                if is_admin:
+                    utenti_attivi = get_utenti_attivi(conn)['username'].tolist()
+                    ingegnere_selezionato = st.selectbox("Seleziona ingegnere", utenti_attivi)
+                else:
+                    ingegnere_selezionato = utente_corrente
+
+                sott_df = get_sottolavori_per_ingegnere(conn, ingegnere_selezionato)
+                pers_df = get_attivita_personali(conn, ingegnere_selezionato)
+                if not pers_df.empty:
+                    pers_df = pers_df.rename(columns={'descrizione': 'sottolavoro_nome'})
+                    pers_df['commessa_nome'] = ""
+                    pers_df['numero_identificativo'] = ""
+                else:
+                    pers_df = pd.DataFrame(columns=['id', 'ingegnere', 'sottolavoro_nome', 'stato', 'note',
+                                                    'data_inizio', 'data_fine_prevista', 'data_fine_effettiva',
+                                                    'commessa_nome', 'numero_identificativo'])
+
+                colonne = ['id', 'tipo', 'Commessa', 'ID Commessa', 'Mansione', 'Ingegnere', 'Stato', 'Note']
+                righe = []
+                for _, row in sott_df.iterrows():
+                    righe.append({
+                        'id': row['id'],
+                        'tipo': 'sottolavoro',
+                        'Commessa': row['commessa_nome'],
+                        'ID Commessa': row['numero_identificativo'],
+                        'Mansione': row['sottolavoro_nome'],
+                        'Ingegnere': row['ingegnere_assegnato'],
+                        'Stato': row['stato'],
+                        'Note': row['note'] if row['note'] else ""
+                    })
+                for _, row in pers_df.iterrows():
+                    righe.append({
+                        'id': row['id'],
+                        'tipo': 'personale',
+                        'Commessa': "",
+                        'ID Commessa': "",
+                        'Mansione': row['sottolavoro_nome'],
+                        'Ingegnere': row['ingegnere'] if 'ingegnere' in row else ingegnere_selezionato,
+                        'Stato': row['stato'],
+                        'Note': row['note'] if row['note'] else ""
+                    })
+                df_ing = pd.DataFrame(righe, columns=colonne) if righe else pd.DataFrame(columns=colonne)
+
+                col_tabella, col_torta = st.columns([2, 1])
+                with col_tabella:
+                    st.markdown(f"**Compiti di {ingegnere_selezionato}**")
+                    edited_ing = st.data_editor(
+                        df_ing,
+                        num_rows="fixed",
                         column_config={
                             "id": None,
+                            "tipo": None,
+                            "Commessa": st.column_config.TextColumn(disabled=True),
+                            "ID Commessa": st.column_config.TextColumn(disabled=True),
+                            "Mansione": st.column_config.TextColumn(disabled=True),
+                            "Ingegnere": st.column_config.TextColumn(disabled=True),
                             "Stato": st.column_config.SelectboxColumn(
-                                "Stato",
-                                options=stato_options,
+                                options=["In corso", "Completato", "In attesa"],
                                 default="In corso"
                             ),
-                            "Ingegnere": st.column_config.SelectboxColumn(
-                                "Ingegnere",
-                                options=ingegneri_attivi,
-                                default=ingegneri_attivi[0] if ingegneri_attivi else None
-                            ),
-                            "Scadenza": st.column_config.TextColumn("Scadenza"),
-                            "Note": st.column_config.TextColumn("Note"),
+                            "Note": st.column_config.TextColumn()
                         },
                         use_container_width=True,
                         hide_index=True,
+                        height=600
                     )
 
-                    if st.button("💾 Salva modifiche sottolavori"):
-                        edited_df['id'] = pd.to_numeric(edited_df['id'], errors='coerce').fillna(0).astype(int)
-                        original_ids = set(sott_df['id'].tolist()) if not sott_df.empty else set()
-                        edited_ids = set()
-                        for _, row in edited_df.iterrows():
+                    if st.button("💾 Salva modifiche ingegnere", key=f"save_ing_{ingegnere_selezionato}"):
+                        for idx, row in edited_ing.iterrows():
                             rid = row['id']
-                            if rid != 0:
-                                edited_ids.add(rid)
-                        to_delete = original_ids - edited_ids
-                        for del_id in to_delete:
-                            elimina_sottolavoro(conn, int(del_id))
-                        for _, row in edited_df.iterrows():
-                            rid = row['id']
-                            nome = row['Nome'] if not pd.isna(row['Nome']) else None
-                            ing = row['Ingegnere']
-                            stato = row['Stato']
-                            scadenza = row['Scadenza'] if pd.notna(row['Scadenza']) and row['Scadenza'] != '' else None
-                            note = row['Note'] if pd.notna(row['Note']) else None
-                            if rid == 0:
-                                if nome:
-                                    aggiungi_sottolavoro(conn, comm_id, nome, ing, datetime.today().strftime("%Y-%m-%d"), scadenza, note, stato)
-                            else:
-                                if nome:
-                                    aggiorna_sottolavoro(conn, int(rid), nome=nome, ingegnere_assegnato=ing, stato=stato,
-                                                        data_fine_prevista=scadenza, note=note,
-                                                        data_fine_effettiva=datetime.today().strftime("%Y-%m-%d") if stato == "Completato" else None)
-                        st.success("Sottolavori aggiornati.")
+                            tipo = row['tipo']
+                            nuovo_stato = row['Stato']
+                            nuove_note = row['Note'] if row['Note'] else None
+                            if tipo == 'sottolavoro':
+                                aggiorna_sottolavoro(conn, int(rid), stato=nuovo_stato, note=nuove_note,
+                                                     data_fine_effettiva=datetime.today().strftime("%Y-%m-%d") if nuovo_stato == "Completato" else None)
+                            elif tipo == 'personale':
+                                aggiorna_attivita_personale(conn, int(rid), stato=nuovo_stato, note=nuove_note,
+                                                            data_fine_effettiva=datetime.today().strftime("%Y-%m-%d") if nuovo_stato == "Completato" else None)
+                        st.success(f"Compiti di {ingegnere_selezionato} aggiornati.")
                         st.rerun()
 
-        # ==================== TAB RIEPILOGO ====================
-        with tab_riepilogo:
-            st.subheader("📋 Riepilogo globale sottolavori")
-            riepilogo_df = leggi_tutti_sottolavori(conn)
-            if not riepilogo_df.empty:
-                # Preparazione dataframe (con Note)
-                df_rip = riepilogo_df[['anno', 'commessa_nome', 'numero_identificativo',
-                                       'nome', 'ingegnere_assegnato', 'stato', 'note']].copy()
-                df_rip.columns = ['Anno', 'Commessa', 'ID Commessa', 'Sottolavoro', 'Ingegnere', 'Stato', 'Note']
-
-                # Colonna helper temporanea per ordinare (verrà rimossa dopo)
-                df_rip['_gruppo'] = df_rip['ID Commessa'].astype(str) + " - " + df_rip['Commessa']
-                df_rip = df_rip.sort_values(by=['Anno', '_gruppo'])
-
-                # Rimuovi la colonna helper PRIMA di mostrare la tabella
-                df_display = df_rip.drop(columns=['_gruppo'])
-
-                # Colore per la cella Stato
-                def color_stato(val):
-                    colors = {
-                        "Completato": "background-color: #d4edda; color: #155724",
-                        "In corso": "background-color: #f8d7da; color: #721c24",
-                        "In attesa": "background-color: #fff3cd; color: #856404"
-                    }
-                    return colors.get(val, "")
-
-                styled_df = df_display.style.map(color_stato, subset=['Stato'])
-
-                # Layout a colonne: tabella (2/3) e grafici (1/3)
-                col_tabella, col_grafico = st.columns([2, 1])
-
-                with col_tabella:
-                    st.markdown("""
-                    <style>
-                    .dataframe-container table td {
-                        padding: 2px 4px !important;
-                        font-size: 0.8rem !important;
-                    }
-                    /* Anno stretto */
-                    .dataframe-container table th:nth-child(1),
-                    .dataframe-container table td:nth-child(1) {
-                        width: 30px !important;
-                        max-width: 30px !important;
-                    }
-                    /* Tutte le altre colonne tranne Note */
-                    .dataframe-container table th:not(:last-child),
-                    .dataframe-container table td:not(:last-child) {
-                        max-width: 80px;
-                        width: 80px;
-                    }
-                    /* Note più larga */
-                    .dataframe-container table th:last-child,
-                    .dataframe-container table td:last-child {
-                        min-width: 200px;
-                    }
-                    </style>
-                    """, unsafe_allow_html=True)
-                    st.dataframe(styled_df, width='stretch', height=800, hide_index=True)
-
-                with col_grafico:
-                    # --- Grafico 1: Stato lavori ---
+                with col_torta:
                     st.subheader("📊 Stato lavori")
-                    conteggi_stato = df_rip['Stato'].value_counts()
-                    for stato in ["Completato", "In corso", "In attesa"]:
-                        if stato not in conteggi_stato:
-                            conteggi_stato[stato] = 0
-                    conteggi_stato = conteggi_stato.reindex(["Completato", "In corso", "In attesa"])
+                    if not df_ing.empty:
+                        conteggi = df_ing['Stato'].value_counts()
+                        for stato in ["Completato", "In corso", "In attesa"]:
+                            if stato not in conteggi:
+                                conteggi[stato] = 0
+                        conteggi = conteggi.reindex(["Completato", "In corso", "In attesa"])
+                        fig = go.Figure(data=[go.Pie(
+                            labels=conteggi.index,
+                            values=conteggi.values,
+                            hole=0.3,
+                            marker=dict(colors=['#28a745', '#dc3545', '#ffc107'])
+                        )])
+                        fig.update_layout(margin=dict(t=0, b=0, l=0, r=0), height=300,
+                                          legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.05))
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("Nessun dato")
 
-                    fig1 = go.Figure(data=[go.Pie(
-                        labels=conteggi_stato.index,
-                        values=conteggi_stato.values,
-                        hole=0.3,
-                        marker=dict(colors=['#28a745', '#dc3545', '#ffc107'])
-                    )])
-                    fig1.update_layout(
-                        margin=dict(t=0, b=0, l=0, r=0),
-                        height=300,
-                        legend=dict(
-                            orientation="v",
-                            yanchor="middle",
-                            y=0.5,
-                            xanchor="left",
-                            x=1.05
-                        )
-                    )
-                    st.plotly_chart(fig1, use_container_width=True)
+                with st.expander("➕ Nuova attività personale"):
+                    with st.form(key=f"nuova_att_pers_{ingegnere_selezionato}", clear_on_submit=True):
+                        desc = st.text_input("Descrizione *")
+                        col_data1, col_data2 = st.columns(2)
+                        with col_data1:
+                            data_in = st.date_input("Data inizio", datetime.today())
+                        with col_data2:
+                            data_fine = st.date_input("Scadenza", datetime.today() + timedelta(days=30))
+                        note = st.text_area("Note")
+                        stato = st.selectbox("Stato", ["In corso", "In attesa"])
+                        if st.form_submit_button("Aggiungi attività"):
+                            if desc:
+                                aggiungi_attivita_personale(conn, ingegnere_selezionato, desc, data_in, data_fine, note, stato)
+                                st.success("Attività personale aggiunta.")
+                                st.rerun()
+                            else:
+                                st.error("La descrizione è obbligatoria.")
 
-                    # --- Grafico 2: Lavori per ingegnere ---
-                    st.subheader("👷‍♂️ Lavori per ingegnere")
-                    conteggi_ing = df_rip['Ingegnere'].value_counts()
-                    fig2 = go.Figure(data=[go.Pie(
-                        labels=conteggi_ing.index,
-                        values=conteggi_ing.values,
-                        hole=0.3,
-                        marker=dict(colors=px.colors.qualitative.Set2)
-                    )])
-                    fig2.update_layout(
-                        margin=dict(t=0, b=0, l=0, r=0),
-                        height=300,
-                        legend=dict(
-                            orientation="v",
-                            yanchor="middle",
-                            y=0.5,
-                            xanchor="left",
-                            x=1.05
-                        )
-                    )
-                    st.plotly_chart(fig2, use_container_width=True)
-
-            else:
-                st.info("Nessun sottolavoro presente.")
-
-        # ==================== TAB INGEGNERI ====================
-        with tab_ingegneri:
-            st.subheader("👷 Mansioni per ingegnere")
-
-            # Determina l'ingegnere da visualizzare
-            utente_corrente = st.session_state['username']
-            is_admin = st.session_state['is_admin']
-            if is_admin:
-                utenti_attivi = ottieni_utenti_attivi(conn)['username'].tolist()
-                ingegnere_selezionato = st.selectbox("Seleziona ingegnere", utenti_attivi)
-            else:
-                ingegnere_selezionato = utente_corrente
-
-            # Carica i dati: sottolavori + attività personali
-            sott_df = pd.read_sql("""
-                SELECT s.id, c.nome as commessa_nome, c.numero_identificativo,
-                       s.nome as sottolavoro_nome, s.ingegnere_assegnato, s.stato, s.note
-                FROM sottolavori s
-                JOIN commesse c ON s.commessa_id = c.id
-                WHERE s.ingegnere_assegnato = %s
-                ORDER BY c.nome, s.nome
-            """, conn, params=(ingegnere_selezionato,))
-
-            pers_df = leggi_attivita_personali(conn, ingegnere_selezionato)
-            # Uniforma le colonne
-            if not pers_df.empty:
-                pers_df = pers_df.rename(columns={'descrizione': 'sottolavoro_nome'})
-                pers_df['commessa_nome'] = ""
-                pers_df['numero_identificativo'] = ""
-            else:
-                pers_df = pd.DataFrame(columns=['id', 'ingegnere', 'sottolavoro_nome', 'stato', 'note',
-                                                'data_inizio', 'data_fine_prevista', 'data_fine_effettiva',
-                                                'commessa_nome', 'numero_identificativo'])
-
-            # DataFrame unificato
-            colonne = ['id', 'tipo', 'Commessa', 'ID Commessa', 'Mansione', 'Ingegnere', 'Stato', 'Note']
-            righe = []
-
-            for _, row in sott_df.iterrows():
-                righe.append({
-                    'id': row['id'],
-                    'tipo': 'sottolavoro',
-                    'Commessa': row['commessa_nome'],
-                    'ID Commessa': row['numero_identificativo'],
-                    'Mansione': row['sottolavoro_nome'],
-                    'Ingegnere': row['ingegnere_assegnato'],
-                    'Stato': row['stato'],
-                    'Note': row['note'] if row['note'] else ""
-                })
-
-            for _, row in pers_df.iterrows():
-                righe.append({
-                    'id': row['id'],
-                    'tipo': 'personale',
-                    'Commessa': "",
-                    'ID Commessa': "",
-                    'Mansione': row['sottolavoro_nome'],
-                    'Ingegnere': row['ingegnere'] if 'ingegnere' in row else ingegnere_selezionato,
-                    'Stato': row['stato'],
-                    'Note': row['note'] if row['note'] else ""
-                })
-
-            if righe:
-                df_ing = pd.DataFrame(righe, columns=colonne)
-            else:
-                df_ing = pd.DataFrame(columns=colonne)
-
-            # Layout a due colonne
-            col_tabella, col_torta = st.columns([2, 1])
-
-            with col_tabella:
-                st.markdown(f"**Compiti di {ingegnere_selezionato}**")
-                # Data editor
-                edited_ing = st.data_editor(
-                    df_ing,
-                    num_rows="fixed",
-                    column_config={
-                        "id": None,
-                        "tipo": None,
-                        "Commessa": st.column_config.TextColumn(disabled=True),
-                        "ID Commessa": st.column_config.TextColumn(disabled=True),
-                        "Mansione": st.column_config.TextColumn(disabled=True),
-                        "Ingegnere": st.column_config.TextColumn(disabled=True),
-                        "Stato": st.column_config.SelectboxColumn(
-                            options=["In corso", "Completato", "In attesa"],
-                            default="In corso"
-                        ),
-                        "Note": st.column_config.TextColumn()
-                    },
-                    use_container_width=True,
-                    hide_index=True,
-                    height=600
-                )
-
-                # Salvataggio modifiche
-                if st.button("💾 Salva modifiche ingegnere", key=f"save_ing_{ingegnere_selezionato}"):
-                    for idx, row in edited_ing.iterrows():
-                        rid = row['id']
-                        tipo = row['tipo']
-                        nuovo_stato = row['Stato']
-                        nuove_note = row['Note'] if row['Note'] else None
-                        if tipo == 'sottolavoro':
-                            aggiorna_sottolavoro(conn, int(rid), stato=nuovo_stato, note=nuove_note,
-                                                 data_fine_effettiva=datetime.today().strftime("%Y-%m-%d") if nuovo_stato == "Completato" else None)
-                        elif tipo == 'personale':
-                            aggiorna_attivita_personale(conn, int(rid), stato=nuovo_stato, note=nuove_note,
-                                                        data_fine_effettiva=datetime.today().strftime("%Y-%m-%d") if nuovo_stato == "Completato" else None)
-                    st.success(f"Compiti di {ingegnere_selezionato} aggiornati.")
-                    st.rerun()
-
-            with col_torta:
-                # Grafico a torta per lo stato
-                st.subheader("📊 Stato lavori")
-                if not df_ing.empty:
-                    conteggi = df_ing['Stato'].value_counts()
-                    for stato in ["Completato", "In corso", "In attesa"]:
-                        if stato not in conteggi:
-                            conteggi[stato] = 0
-                    conteggi = conteggi.reindex(["Completato", "In corso", "In attesa"])
-                    fig = go.Figure(data=[go.Pie(
-                        labels=conteggi.index,
-                        values=conteggi.values,
-                        hole=0.3,
-                        marker=dict(colors=['#28a745', '#dc3545', '#ffc107'])
-                    )])
-                    fig.update_layout(margin=dict(t=0, b=0, l=0, r=0), height=300,
-                                      legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.05))
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Nessun dato")
-
-            # Aggiunta rapida di una nuova attività personale
-            with st.expander("➕ Nuova attività personale"):
-                with st.form(key=f"nuova_att_pers_{ingegnere_selezionato}", clear_on_submit=True):
-                    desc = st.text_input("Descrizione *")
-                    col_data1, col_data2 = st.columns(2)
-                    with col_data1:
-                        data_in = st.date_input("Data inizio", datetime.today())
-                    with col_data2:
-                        data_fine = st.date_input("Scadenza", datetime.today() + timedelta(days=30))
+        # -------------------- ATTIVITÀ PERSONALI --------------------
+        elif scelta == "Attività Personali":
+            st.header("👤 Attività Personali")
+            ing_corrente = st.session_state['username']
+            with st.expander("➕ Nuova attività", expanded=False):
+                with st.form("nuova_att_pers"):
+                    desc = st.text_input("Descrizione*")
+                    data_in = st.date_input("Data inizio", datetime.today())
+                    data_fine = st.date_input("Scadenza")
                     note = st.text_area("Note")
                     stato = st.selectbox("Stato", ["In corso", "In attesa"])
-                    if st.form_submit_button("Aggiungi attività"):
+                    if st.form_submit_button("Aggiungi"):
                         if desc:
-                            aggiungi_attivita_personale(conn, ingegnere_selezionato, desc, data_in, data_fine, note, stato)
-                            st.success("Attività personale aggiunta.")
+                            aggiungi_attivita_personale(conn, ing_corrente, desc, data_in, data_fine, note, stato)
+                            st.success("Aggiunta.")
                             st.rerun()
                         else:
-                            st.error("La descrizione è obbligatoria.")
+                            st.error("Descrizione obbligatoria.")
 
-    # -------------------- ATTIVITÀ PERSONALI --------------------
-    elif scelta == "Attività Personali":
-        st.header("👤 Attività Personali")
-        ing_corrente = st.session_state['username']
-        with st.expander("➕ Nuova attività", expanded=False):
-            with st.form("nuova_att_pers"):
-                desc = st.text_input("Descrizione*")
-                data_in = st.date_input("Data inizio", datetime.today())
-                data_fine = st.date_input("Scadenza")
-                note = st.text_area("Note")
-                stato = st.selectbox("Stato", ["In corso", "In attesa"])
-                if st.form_submit_button("Aggiungi"):
-                    if desc:
-                        aggiungi_attivita_personale(conn, ing_corrente, desc, data_in, data_fine, note, stato)
-                        st.success("Aggiunta.")
-                        st.rerun()
-                    else:
-                        st.error("Descrizione obbligatoria.")
-
-        att_df = leggi_attivita_personali(conn, ing_corrente)
-        if att_df.empty:
-            st.info("Nessuna attività personale registrata.")
-        else:
-            for _, att in att_df.iterrows():
-                with st.expander(f"📝 {att['descrizione']} – {att['stato']}"):
-                    st.write(f"Inizio: {att['data_inizio']} | Scadenza: {att['data_fine_prevista']} | Fine: {att['data_fine_effettiva'] or '---'}")
-                    nuovo_stato = st.selectbox("Stato", ["In corso", "Completato", "In attesa"],
-                                               index=["In corso", "Completato", "In attesa"].index(att['stato']),
-                                               key=f"stato_p_{att['id']}")
-                    nuova_note = st.text_area("Note", att['note'] or "", key=f"note_p_{att['id']}")
-                    colA, colB = st.columns(2)
-                    if colA.button("Aggiorna", key=f"upd_p_{att['id']}"):
-                        aggiorna_attivita_personale(conn, att['id'], stato=nuovo_stato, note=nuova_note)
-                        st.rerun()
-                    if colB.button("Elimina", key=f"del_p_{att['id']}"):
-                        elimina_attivita_personale(conn, att['id'])
-                        st.warning("Eliminata.")
-                        st.rerun()
-
-    # -------------------- RESOCONTO --------------------
-    elif scelta == "Resoconto":
-        st.header("📋 Cosa sta facendo ogni ingegnere")
-        ingegneri = ottieni_utenti_attivi(conn)['username'].tolist()
-        ing_sel = st.selectbox("Scegli ingegnere", ingegneri)
-        st.markdown(f"### {ing_sel}")
-
-        sott_in_corso = pd.read_sql("""
-            SELECT s.*, c.nome as commessa_nome, c.numero_identificativo, a.anno
-            FROM sottolavori s
-            JOIN commesse c ON s.commessa_id = c.id
-            LEFT JOIN anni a ON c.anno_id = a.id
-            WHERE s.ingegnere_assegnato = %s AND s.stato = 'In corso'
-        """, conn, params=(ing_sel,))
-        if not sott_in_corso.empty:
-            st.markdown("**Sottolavori in corso:**")
-            for _, r in sott_in_corso.iterrows():
-                st.write(f"🔸 {r['nome']} (Commessa {r['numero_identificativo']} - {r['commessa_nome']}, anno {int(r['anno']) if pd.notna(r['anno']) else 'n/d'}) – scadenza {r['data_fine_prevista']}")
-
-        pers_in_corso = pd.read_sql("SELECT * FROM attivita_personali WHERE ingegnere=%s AND stato='In corso'", conn, params=(ing_sel,))
-        if not pers_in_corso.empty:
-            st.markdown("**Attività personali in corso:**")
-            for _, r in pers_in_corso.iterrows():
-                st.write(f"👤 {r['descrizione']} (scadenza {r['data_fine_prevista']})")
-
-        if sott_in_corso.empty and pers_in_corso.empty:
-            st.success("Nessun incarico in corso 🎉")
-
-    # -------------------- STORICO --------------------
-    elif scelta == "Storico":
-        st.header("🕰️ Situazione a una data passata")
-        data_scelta = st.date_input("Data di riferimento", datetime.today() - timedelta(weeks=4))
-        data_limite = datetime.combine(data_scelta, datetime.max.time())
-        comm, sott, att = tutte_entita_alla_data(conn, data_limite)
-        tab1, tab2, tab3 = st.tabs(["Commesse", "Sottolavori", "Attività Personali"])
-        with tab1:
-            if comm:
-                st.dataframe(pd.DataFrame(comm))
+            att_df = get_attivita_personali(conn, ing_corrente)
+            if att_df.empty:
+                st.info("Nessuna attività personale registrata.")
             else:
-                st.info("Nessuna commessa.")
-        with tab2:
-            if sott:
-                st.dataframe(pd.DataFrame(sott))
-            else:
-                st.info("Nessun sottolavoro.")
-        with tab3:
-            if att:
-                st.dataframe(pd.DataFrame(att))
-            else:
-                st.info("Nessuna attività personale.")
+                for _, att in att_df.iterrows():
+                    with st.expander(f"📝 {att['descrizione']} – {att['stato']}"):
+                        st.write(f"Inizio: {att['data_inizio']} | Scadenza: {att['data_fine_prevista']} | Fine: {att['data_fine_effettiva'] or '---'}")
+                        nuovo_stato = st.selectbox("Stato", ["In corso", "Completato", "In attesa"],
+                                                   index=["In corso", "Completato", "In attesa"].index(att['stato']),
+                                                   key=f"stato_p_{att['id']}")
+                        nuova_note = st.text_area("Note", att['note'] or "", key=f"note_p_{att['id']}")
+                        colA, colB = st.columns(2)
+                        if colA.button("Aggiorna", key=f"upd_p_{att['id']}"):
+                            aggiorna_attivita_personale(conn, att['id'], stato=nuovo_stato, note=nuova_note)
+                            st.rerun()
+                        if colB.button("Elimina", key=f"del_p_{att['id']}"):
+                            elimina_attivita_personale(conn, att['id'])
+                            st.warning("Eliminata.")
+                            st.rerun()
 
-    # -------------------- BACKUP --------------------
-    elif scelta == "Backup":
-        st.header("💾 Backup dati")
-        if st.button("Scarica backup completo (Excel)"):
-            excel_data = esporta_excel(conn)
-            st.download_button(
-                label="📥 Clicca qui per scaricare il file Excel",
-                data=excel_data,
-                file_name=f"backup_commesse_{datetime.today().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        st.markdown("Il database PostgreSQL è gestito dal provider cloud.")
+        # -------------------- RESOCONTO --------------------
+        elif scelta == "Resoconto":
+            st.header("📋 Cosa sta facendo ogni ingegnere")
+            ingegneri = get_utenti_attivi(conn)['username'].tolist()
+            ing_sel = st.selectbox("Scegli ingegnere", ingegneri)
+            st.markdown(f"### {ing_sel}")
 
-    # -------------------- AMMINISTRAZIONE UTENTI --------------------
-    elif scelta == "Amministrazione Utenti" and st.session_state['is_admin']:
-        st.header("👥 Gestione Ingegneri")
-        utenti = ottieni_tutti_utenti(conn)
-        st.dataframe(utenti[['username', 'nome', 'cognome', 'attivo', 'is_admin']], use_container_width=True)
+            sott_in_corso = get_sottolavori_in_corso_per_ingegnere(conn, ing_sel)
+            if not sott_in_corso.empty:
+                st.markdown("**Sottolavori in corso:**")
+                for _, r in sott_in_corso.iterrows():
+                    st.write(f"🔸 {r['nome']} (Commessa {r['numero_identificativo']} - {r['commessa_nome']}, anno {int(r['anno']) if pd.notna(r['anno']) else 'n/d'}) – scadenza {r['data_fine_prevista']}")
 
-        with st.expander("➕ Nuovo utente"):
-            with st.form("nuovo_utente"):
-                new_user = st.text_input("Username")
-                new_pw = st.text_input("Password", type="password")
-                new_nome = st.text_input("Nome")
-                new_cogn = st.text_input("Cognome")
-                admin_flag = st.checkbox("Amministratore")
-                if st.form_submit_button("Crea"):
-                    if new_user and new_pw and new_nome and new_cogn:
-                        ok, msg = aggiungi_utente(conn, new_user, new_pw, new_nome, new_cogn, admin_flag)
-                        st.success(msg) if ok else st.error(msg)
-                        st.rerun()
-                    else:
-                        st.error("Tutti i campi obbligatori.")
+            pers_in_corso = get_attivita_personali_in_corso(conn, ing_sel)
+            if not pers_in_corso.empty:
+                st.markdown("**Attività personali in corso:**")
+                for _, r in pers_in_corso.iterrows():
+                    st.write(f"👤 {r['descrizione']} (scadenza {r['data_fine_prevista']})")
 
-        with st.expander("🔧 Attiva/Disattiva utente"):
-            username_sel = st.selectbox("Utente", utenti['username'].tolist())
-            attuale_stato = utenti[utenti['username'] == username_sel]['attivo'].values[0]
-            nuovo_stato = st.checkbox("Attivo", value=bool(attuale_stato))
-            if st.button("Aggiorna stato"):
-                aggiorna_stato_utente(conn, username_sel, int(nuovo_stato))
-                st.success(f"Stato di {username_sel} aggiornato.")
-                st.rerun()
+            if sott_in_corso.empty and pers_in_corso.empty:
+                st.success("Nessun incarico in corso 🎉")
 
-    # Rilascia la connessione al termine
-    release_connection(conn)
+        # -------------------- STORICO --------------------
+        elif scelta == "Storico":
+            st.header("🕰️ Situazione a una data passata")
+            data_scelta = st.date_input("Data di riferimento", datetime.today() - timedelta(weeks=4))
+            data_limite = datetime.combine(data_scelta, datetime.max.time())
+            comm, sott, att = tutte_entita_alla_data(conn, data_limite)
+            tab1, tab2, tab3 = st.tabs(["Commesse", "Sottolavori", "Attività Personali"])
+            with tab1:
+                if comm:
+                    st.dataframe(pd.DataFrame(comm))
+                else:
+                    st.info("Nessuna commessa.")
+            with tab2:
+                if sott:
+                    st.dataframe(pd.DataFrame(sott))
+                else:
+                    st.info("Nessun sottolavoro.")
+            with tab3:
+                if att:
+                    st.dataframe(pd.DataFrame(att))
+                else:
+                    st.info("Nessuna attività personale.")
+
+        # -------------------- BACKUP --------------------
+        elif scelta == "Backup":
+            st.header("💾 Backup dati")
+            if st.button("Scarica backup completo (Excel)"):
+                excel_data = esporta_excel(conn)
+                st.download_button(
+                    label="📥 Clicca qui per scaricare il file Excel",
+                    data=excel_data,
+                    file_name=f"backup_commesse_{datetime.today().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            st.markdown("Il database PostgreSQL è gestito dal provider cloud.")
+
+        # -------------------- AMMINISTRAZIONE UTENTI --------------------
+        elif scelta == "Amministrazione Utenti" and st.session_state['is_admin']:
+            st.header("👥 Gestione Ingegneri")
+            utenti = get_tutti_utenti(conn)
+            st.dataframe(utenti[['username', 'nome', 'cognome', 'attivo', 'is_admin']], use_container_width=True)
+
+            with st.expander("➕ Nuovo utente"):
+                with st.form("nuovo_utente"):
+                    new_user = st.text_input("Username")
+                    new_pw = st.text_input("Password", type="password")
+                    new_nome = st.text_input("Nome")
+                    new_cogn = st.text_input("Cognome")
+                    admin_flag = st.checkbox("Amministratore")
+                    if st.form_submit_button("Crea"):
+                        if new_user and new_pw and new_nome and new_cogn:
+                            ok, msg = aggiungi_utente(conn, new_user, new_pw, new_nome, new_cogn, admin_flag)
+                            st.success(msg) if ok else st.error(msg)
+                            st.rerun()
+                        else:
+                            st.error("Tutti i campi obbligatori.")
+
+            with st.expander("🔧 Attiva/Disattiva utente"):
+                username_sel = st.selectbox("Utente", utenti['username'].tolist())
+                attuale_stato = utenti[utenti['username'] == username_sel]['attivo'].values[0]
+                nuovo_stato = st.checkbox("Attivo", value=bool(attuale_stato))
+                if st.button("Aggiorna stato"):
+                    aggiorna_stato_utente(conn, username_sel, int(nuovo_stato))
+                    st.success(f"Stato di {username_sel} aggiornato.")
+                    st.rerun()
 
 if __name__ == "__main__":
     main()

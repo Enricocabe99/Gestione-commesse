@@ -11,16 +11,24 @@ import json
 import os
 
 # ==================== CONFIG ====================
-# In produzione, usa i secrets di Streamlit Cloud; in locale, imposta la variabile d'ambiente
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:u4ky3LIMpe89TvrX@db.hsvspwdajfbbgdmosvqa.supabase.co:5432/postgres"
-)
+def get_database_url():
+    """Legge l'URL del database: prima dai secrets Streamlit, poi dall'ambiente."""
+    try:
+        return st.secrets["DATABASE_URL"]
+    except (FileNotFoundError, KeyError):
+        return os.getenv(
+            "DATABASE_URL",
+            "postgresql://postgres:password@localhost:5432/commesse"
+        )
+
+def get_engine():
+    url = get_database_url()
+    # Aggiunge SSL se è un URL di Supabase e non lo ha già
+    if "supabase.co" in url and "sslmode" not in url:
+        url += "?sslmode=require"
+    return create_engine(url, pool_pre_ping=True)
 
 # ==================== FUNZIONI DATABASE ====================
-def get_engine():
-    return create_engine(DATABASE_URL, pool_pre_ping=True)
-
 def init_db(engine):
     with engine.connect() as conn:
         conn.execute(text("""
@@ -90,7 +98,7 @@ def init_db(engine):
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_commesse_numero ON commesse(numero_identificativo)"))
             conn.commit()
         except:
-            pass  # indice già presente o errore ignorato
+            pass  # già presente o ignorato
 
     # Admin predefinito
     with engine.connect() as conn:
@@ -149,7 +157,6 @@ def ottieni_o_crea_anno(engine, anno):
         row = conn.execute(text("SELECT id FROM anni WHERE anno=:a"), {"a": anno_int}).fetchone()
         if row:
             return row[0]
-        # Inserisci e ottieni l'id
         new_id = conn.execute(text("INSERT INTO anni (anno) VALUES (:a) RETURNING id"), {"a": anno_int}).fetchone()[0]
         conn.commit()
         return new_id
@@ -183,7 +190,6 @@ def aggiorna_commessa(engine, commessa_id, **campi):
     with engine.connect() as conn:
         conn.execute(text(f"UPDATE commesse SET {set_clause} WHERE id=:cid"), params)
         conn.commit()
-        # Salva in cronologia (recupera i dati attuali)
         row = conn.execute(text("SELECT * FROM commesse WHERE id=:cid"), {"cid": commessa_id}).fetchone()
         if row:
             dati = {"id": row[0], "nome": row[2], "numero_identificativo": row[3]}
@@ -313,35 +319,6 @@ def tutte_entita_alla_data(engine, data_limite):
             att_pers.append(stato_prec)
     return commesse, sottolavori, att_pers
 
-# ==================== GRAFICO ====================
-def prepara_dati_grafico(engine, ingegnere=None):
-    sott = pd.read_sql_query("""
-        SELECT ingegnere_assegnato as ingegnere, data_inizio, data_fine_effettiva, stato
-        FROM sottolavori
-    """, engine)
-    pers = pd.read_sql_query("""
-        SELECT ingegnere, data_inizio, data_fine_effettiva, stato
-        FROM attivita_personali
-    """, engine)
-    tutto = pd.concat([sott, pers], ignore_index=True)
-    if ingegnere:
-        tutto = tutto[tutto['ingegnere'] == ingegnere]
-
-    tutto['data_inizio'] = pd.to_datetime(tutto['data_inizio'], errors='coerce')
-    tutto['data_fine_effettiva'] = pd.to_datetime(tutto['data_fine_effettiva'], errors='coerce')
-
-    iniziati = tutto.dropna(subset=['data_inizio']).copy()
-    iniziati['mese'] = iniziati['data_inizio'].dt.to_period('M').dt.start_time
-    iniziati_count = iniziati.groupby('mese').size().reset_index(name='nuovi_incarichi')
-
-    terminati = tutto.dropna(subset=['data_fine_effettiva']).copy()
-    terminati['mese'] = terminati['data_fine_effettiva'].dt.to_period('M').dt.start_time
-    terminati_count = terminati.groupby('mese').size().reset_index(name='completati')
-
-    df_grafico = pd.merge(iniziati_count, terminati_count, on='mese', how='outer').fillna(0)
-    df_grafico = df_grafico.sort_values('mese')
-    return df_grafico
-
 # ==================== BACKUP ====================
 def esporta_excel(engine):
     output = io.BytesIO()
@@ -426,12 +403,11 @@ def main():
                     st.session_state.show_delete_dialog = None
                     st.rerun()
 
-        # Tab per Albero, Riepilogo e Ingegneri
+        # Tab
         tab_albero, tab_riepilogo, tab_ingegneri = st.tabs(["🛠️ Lavori", "📋 Riepilogo", "👷 Ingegneri"])
 
         # ==================== TAB ALBERO ====================
         with tab_albero:
-            # Form per nuova commessa (compatto)
             with st.expander("➕ Nuova Commessa", expanded=False):
                 with st.form("crea_commessa_form", clear_on_submit=True):
                     col1, col2, col3, col4, col5 = st.columns(5)
@@ -462,10 +438,8 @@ def main():
                                     st.error(msg)
 
             st.markdown("---")
-
             col_albero, col_dettaglio = st.columns([1, 3])
 
-            # ---------------- COLONNA ALBERO ----------------
             with col_albero:
                 st.subheader("🗂️ Commesse")
                 search_query = st.text_input("🔍 Cerca commessa", placeholder="Nome o numero...", key="search_albero")
@@ -483,7 +457,7 @@ def main():
                         for _, row in tutte.iterrows():
                             st.session_state[f"exp_comm_{row['id']}"] = False
                         st.rerun()
-                
+
                 tutte_commesse = leggi_tutte_commesse(engine)
                 if not tutte_commesse.empty:
                     if search_query.strip():
@@ -539,7 +513,6 @@ def main():
                 else:
                     st.info("Nessuna commessa presente. Creane una con il pulsante sopra.")
 
-            # ---------------- COLONNA DETTAGLIO: TABELLA SOTTOLAVORI ----------------
             with col_dettaglio:
                 if st.session_state.selected_commessa_id is None:
                     st.info("Clicca sul nome di una commessa nell'albero per visualizzare/modificare i sottolavori.")
@@ -553,7 +526,6 @@ def main():
 
                     comm_row = df_comm.iloc[0]
 
-                    # --- Modalità modifica (numero, nome, anno, note) attivata con la matita ---
                     if f"edit_commessa_{comm_id}" not in st.session_state:
                         st.session_state[f"edit_commessa_{comm_id}"] = False
 
@@ -564,13 +536,10 @@ def main():
                                 nuovo_numero = st.text_input("Numero identificativo", value=comm_row['numero_identificativo'])
                             with col2:
                                 nuovo_nome = st.text_input("Nome commessa", value=comm_row['nome'])
-                            
                             anno_corrente = int(comm_row['anno']) if pd.notna(comm_row['anno']) else datetime.today().year
                             nuovo_anno = st.text_input("Anno", value=str(anno_corrente))
-                            
                             note_correnti = comm_row['note'] if comm_row['note'] else ""
                             nuove_note = st.text_area("Note", value=note_correnti, height=100)
-                            
                             col_salva, col_annulla = st.columns(2)
                             with col_salva:
                                 if st.form_submit_button("💾 Salva modifiche"):
@@ -609,7 +578,6 @@ def main():
                     if comm_row['note']:
                         st.caption(f"Note: {comm_row['note']}")
 
-                    # --- Editor sottolavori ---
                     sott_df = leggi_sottolavori_per_commessa(engine, comm_id)
                     if sott_df.empty:
                         sott_df = pd.DataFrame(columns=['id', 'nome', 'ingegnere_assegnato', 'stato', 'data_inizio', 'data_fine_prevista', 'note'])

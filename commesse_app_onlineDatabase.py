@@ -23,9 +23,17 @@ def get_database_url():
 
 def get_engine():
     url = get_database_url()
-    # Aggiunge SSL se è un URL di Supabase e non lo ha già
-    if "supabase.co" in url and "sslmode" not in url:
-        url += "?sslmode=require"
+    # Se l'URL punta a Supabase, forziamo SSL e altri parametri senza toccare l'URL
+    if "supabase.co" in url:
+        connect_args = {
+            "sslmode": "require",
+            "connect_timeout": 10,
+        }
+        # Rimuoviamo eventuali parametri SSL già presenti nell'URL per evitare duplicati
+        if "sslmode" in url:
+            url = url.split("?")[0]
+        return create_engine(url, connect_args=connect_args, pool_pre_ping=True)
+    # Per altri database, usiamo l'URL così com'è
     return create_engine(url, pool_pre_ping=True)
 
 # ==================== FUNZIONI DATABASE ====================

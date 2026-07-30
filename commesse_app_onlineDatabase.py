@@ -18,7 +18,7 @@ def get_database_url():
     except (FileNotFoundError, KeyError):
         return os.getenv(
             "DATABASE_URL",
-            "postgresql://postgres:password@localhost:5432/commesse"
+            "postgresql://postgres:u4ky3LIMpe89TvrX@db.hsvspwdajfbbgdmosvqa.supabase.co:5432/postgres"
         )
 
 def get_engine():
